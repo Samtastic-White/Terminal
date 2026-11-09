@@ -1,0 +1,48 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Mirrors knowledge/governance/policies.md (§1 Secrets, §9 Git, §11 Agent config).
+  // Rule order matters for OpenCode: the last matching rule wins.
+  "permissions": [
+    // 1. Secrets and credentials (Policies § 1)
+    { "action": "read", "resource": ".env", "effect": "deny" },
+    { "action": "read", "resource": ".env.*", "effect": "deny" },
+    { "action": "edit", "resource": ".env", "effect": "deny" },
+    { "action": "edit", "resource": ".env.*", "effect": "deny" },
+
+    // Git: read-only inspection allowed; mutation forbidden (Policies § 9)
+    { "action": "shell", "resource": "git status", "effect": "allow" },
+    { "action": "shell", "resource": "git status *", "effect": "allow" },
+    { "action": "shell", "resource": "git diff *", "effect": "allow" },
+    { "action": "shell", "resource": "git log *", "effect": "allow" },
+    { "action": "shell", "resource": "git show *", "effect": "allow" },
+    { "action": "shell", "resource": "git add *", "effect": "deny" },
+    { "action": "shell", "resource": "git commit *", "effect": "deny" },
+    { "action": "shell", "resource": "git push *", "effect": "deny" },
+    { "action": "shell", "resource": "git pull *", "effect": "deny" },
+    { "action": "shell", "resource": "git reset *", "effect": "deny" },
+    { "action": "shell", "resource": "git rebase *", "effect": "deny" },
+    { "action": "shell", "resource": "git merge *", "effect": "deny" },
+    { "action": "shell", "resource": "git checkout *", "effect": "deny" },
+    { "action": "shell", "resource": "git clean *", "effect": "deny" },
+    { "action": "shell", "resource": "git stash *", "effect": "deny" },
+    { "action": "shell", "resource": "git cherry-pick *", "effect": "deny" },
+
+    // Dependency installs are gated (Policies § 5)
+    { "action": "shell", "resource": "cargo add *", "effect": "ask" },
+    { "action": "shell", "resource": "cargo install *", "effect": "ask" },
+    { "action": "shell", "resource": "cargo remove *", "effect": "ask" },
+    { "action": "shell", "resource": "npm install -g *", "effect": "deny" },
+
+    // Agent configuration is gated (Policies § 11)
+    { "action": "edit", "resource": "AGENTS.md", "effect": "ask" },
+    { "action": "edit", "resource": "CLAUDE.md", "effect": "ask" },
+    { "action": "edit", "resource": "knowledge/*", "effect": "ask" },
+    { "action": "edit", "resource": "knowledge/**", "effect": "ask" },
+    { "action": "edit", "resource": ".agents/*", "effect": "ask" },
+    { "action": "edit", "resource": ".agents/**", "effect": "ask" },
+    { "action": "edit", "resource": ".claude/*", "effect": "ask" },
+    { "action": "edit", "resource": ".claude/**", "effect": "ask" },
+    { "action": "edit", "resource": ".opencode/*", "effect": "ask" },
+    { "action": "edit", "resource": ".opencode/**", "effect": "ask" }
+  ]
+}

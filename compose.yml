@@ -1,0 +1,23 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: dev.Dockerfile
+      args:
+        UID: 1000
+        GID: 1000
+    container_name: terminal-gpui-dev
+    env_file:
+    - .env
+    volumes:
+      - .:/workspace:z
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}
+    environment:
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+    devices:
+      - /dev/dri:/dev/dri
+    ipc: host
+    network_mode: host

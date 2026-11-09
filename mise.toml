@@ -1,0 +1,26 @@
+[tools]
+rust = "1.99"
+
+[env]
+RUST_BACKTRACE = "1"
+CARGO_TERM_COLOR = "always"
+
+[tasks.up]
+description = "Levanta el entorno de Docker en segundo plano"
+run = "docker compose up -d"
+
+[tasks.shell]
+description = "Entra directamente a la terminal Zsh del contenedor"
+run = "docker compose exec dev zsh"
+
+[tasks.build]
+description = "Compila la terminal dentro del contenedor"
+run = "docker compose exec dev cargo build"
+
+[tasks.run]
+description = "Ejecuta la terminal en tu pantalla"
+run = "docker compose exec dev cargo run"
+
+[tasks.clean]
+description = "Limpia los contenedores e imágenes de Docker del proyecto"
+run = "docker compose down --rmi all -v"

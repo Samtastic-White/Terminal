@@ -1,0 +1,31 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "path": ".zed/ra-docker.sh"
+      },
+      "initialization_options": {
+        "linkedProjects": ["/workspace/Cargo.toml"],
+        "lru": {
+          "capacity": 32
+        },
+        "cachePriming": {
+          "enable": false
+        },
+        "cargo": {
+          "allTargets": false
+        },
+        "check": {
+          "command": "clippy",
+          "allTargets": false
+        },
+        "diagnostics": {
+          "enable": false
+        },
+        "procMacro": {
+          "processes": 1
+        }
+      }
+    }
+  }
+}
