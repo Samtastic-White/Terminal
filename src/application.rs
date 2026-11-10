@@ -1,5 +1,4 @@
-//! Application layer: orchestrates business use cases. Depends only on
-//! Domain (`knowledge/architecture.md` § Layer Responsibilities) — never
-//! on gpui or Infrastructure directly.
+//! Application layer: orchestrates business use cases. Depends only on Domain,
+//! never on gpui or infrastructure directly.
 
 pub mod session;

@@ -3,7 +3,7 @@
 use gpui::*;
 use crate::application::session::SessionService;
 use crate::domain::pty::PtyPort;
-use crate::domain::pty::PtySize;
+use crate::domain::size::TerminalSize;
 use crate::infrastructure::parser::BlockTextWriter;
 use crate::infrastructure::pty::PtyAdapter;
 use crate::presentation::components::{input_editor::InputEditor, row::render_rows};
@@ -11,7 +11,6 @@ use crate::presentation::theme::TerminalTheme;
 use crate::common::errors::Result;
 use std::sync::{mpsc::Receiver, Arc, Mutex};
 
-/// Main terminal window state
 pub struct TerminalWindow {
     focus_handle: FocusHandle,
     session_service: Arc<Mutex<SessionService>>,
@@ -21,20 +20,17 @@ pub struct TerminalWindow {
 }
 
 impl TerminalWindow {
-    /// Create a new terminal window with PTY adapter and writer
     pub fn new(cx: &mut Context<Self>) -> Entity<Self> {
         let theme = TerminalTheme::default();
-        
-        // Create infrastructure adapters FIRST, spawn, then extract receiver
+
+        // Resized on the first render.
         let mut pty_adapter = PtyAdapter::new();
-        let block_writer = BlockTextWriter::new(80); // Initial cols, will resize on first render
-        
-        // Spawn the shell immediately to get the receiver
-        let initial_size = PtySize::new(80, 24);
+        let block_writer = BlockTextWriter::new(80);
+
+        let initial_size = TerminalSize::new(80, 24);
         PtyPort::spawn(&mut pty_adapter, initial_size).expect("Failed to spawn PTY");
         let pty_receiver = pty_adapter.take_output().expect("PTY receiver not available");
-        
-        // NOW box the adapter and create session service
+
         let session_service = Arc::new(Mutex::new(SessionService::new(
             Box::new(pty_adapter),
             Box::new(block_writer),
@@ -42,10 +38,9 @@ impl TerminalWindow {
 
         cx.new(|cx| {
             let session_service = session_service.clone();
-            // Create input editor with callbacks
             let input_editor = cx.new(|cx| InputEditor::new(
                 theme.clone(),
-                // on_submit: send keystrokes to PTY
+                // Submit: keystrokes to the PTY.
                 {
                     let session_service = session_service.clone();
                     move |text: String| {
@@ -53,7 +48,7 @@ impl TerminalWindow {
                         svc.write_keystrokes(text.as_bytes())
                     }
                 },
-                // on_ctrl_c: send Ctrl+C
+                // Ctrl+C.
                 {
                     let session_service = session_service.clone();
                     move || {
@@ -61,7 +56,7 @@ impl TerminalWindow {
                         svc.write_keystrokes(b"\x03")
                     }
                 },
-                // on_ctrl_d: send Ctrl+D (EOF)
+                // Ctrl+D (EOF).
                 {
                     let session_service = session_service.clone();
                     move || {
@@ -69,7 +64,7 @@ impl TerminalWindow {
                         svc.write_keystrokes(b"\x04")
                     }
                 },
-                // on_ctrl_l: send Ctrl+L (clear screen)
+                // Ctrl+L (clear screen).
                 {
                     let session_service = session_service.clone();
                     move || {
@@ -90,17 +85,14 @@ impl TerminalWindow {
         })
     }
 
-    /// Process pending PTY output (non-blocking)
     fn process_pty_output(&mut self) {
-        // Try to receive all available chunks
         while let Ok(chunk) = self.pty_receiver.try_recv() {
             let mut svc = self.session_service.lock().unwrap();
             svc.ingest_bytes(&chunk);
         }
     }
 
-    /// Handle window resize
-    fn handle_resize(&mut self, size: PtySize) -> Result<()> {
+    fn handle_resize(&mut self, size: TerminalSize) -> Result<()> {
         let mut svc = self.session_service.lock().unwrap();
         svc.resize(size)
     }
@@ -114,24 +106,20 @@ impl Focusable for TerminalWindow {
 
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Process any pending PTY output
         self.process_pty_output();
 
-        // Get current document rows
         let rows = {
             let svc = self.session_service.lock().unwrap();
             let document = svc.document();
             document.rows().iter().cloned().collect::<Vec<_>>()
         };
 
-        // Calculate size from window bounds
         let bounds = window.bounds();
-        let char_width = self.theme.font_size * 0.6; // Approximate monospace char width
+        let char_width = self.theme.font_size * 0.6;
         let cols = (bounds.size.width / px(char_width)).max(1.0) as u16;
         let rows_count = (bounds.size.height / px(self.theme.font_size * self.theme.line_height)).max(1.0) as u16;
-        let size = PtySize::new(cols, rows_count);
+        let size = TerminalSize::new(cols, rows_count);
 
-        // Handle resize
         let _ = self.handle_resize(size);
 
         div()
@@ -148,7 +136,6 @@ impl Render for TerminalWindow {
                 });
             }))
             .child(
-                // Output area - scrollable
                 div()
                     .id("output-area")
                     .flex()
@@ -159,14 +146,10 @@ impl Render for TerminalWindow {
                     .py_2()
                     .child(render_rows(&rows, &self.theme))
             )
-            .child(
-                // Input editor at bottom
-                self.input_editor.clone()
-            )
+            .child(self.input_editor.clone())
     }
 }
 
-/// App state holding the terminal window
 pub struct TerminalApp {
     window: Option<Entity<TerminalWindow>>,
 }
@@ -191,7 +174,6 @@ impl TerminalApp {
 
 impl Render for TerminalApp {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // App-level render - the window renders itself
         div().size_full()
     }
 }

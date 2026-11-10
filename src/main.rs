@@ -7,7 +7,8 @@ mod infrastructure;
 mod presentation;
 
 use application::session::SessionService;
-use domain::pty::{PtyPort, PtySize};
+use domain::pty::PtyPort;
+use domain::size::TerminalSize;
 use gpui_platform::application;
 use infrastructure::parser::BlockTextWriter;
 use infrastructure::pty::PtyAdapter;
@@ -17,25 +18,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Idle/pacing probe — activated with `NT_MEASURE` (any value: empty/0/n = off).
-//
-// Measures, for a fixed 15 s settle + 10 samples x 2 s window:
-//   * PSS/RSS of the process (via /proc/self/smaps_rollup, PSS = criterion
-//     metric, fair with shared memory).
-//   * Render pacing: the frame chain ticks every vsync period; per-sample
-//     frame deltas give the effective fps and per-frame gaps give P50/P99.
-//
-// Status: all probe state lives in statics so the frame chain callback and
-// the sampling thread never touch the render thread's state machine and the
-// app's own state is untouched. No extra crates (std + gpui only).
-// ---------------------------------------------------------------------------
+// Idle/pacing probe, enabled with `NT_MEASURE`. Probe state lives in statics so
+// the frame callback and the sampling thread never touch the app's own state.
 
 const PROBE_SETTLE: Duration = Duration::from_secs(15);
 const PROBE_SAMPLES: usize = 10;
 const PROBE_STEP: Duration = Duration::from_secs(2);
 
-/// Phase 0 criterion threshold: idle < 30 MB PSS (kB).
 const IDLE_PSS_LIMIT_KB: u64 = 30_000;
 /// Vsync period of a 144 Hz monitor, in microseconds (informational target).
 const PACING_TARGET_US: u64 = 6_944;
@@ -206,11 +195,10 @@ fn main() {
     application().run(|cx: &mut App| {
         let measure = measure_enabled();
 
-        // Composition root (design § 1, T10): adapters → services → view.
-        // Phase 0's measurement probe below stays untouched.
+        // Composition root: adapters → services → view.
         let mut pty_adapter = PtyAdapter::new();
         let block_writer = BlockTextWriter::new(80);
-        let initial_size = PtySize::new(80, 24);
+        let initial_size = TerminalSize::new(80, 24);
 
         if let Err(error) = pty_adapter.spawn(initial_size) {
             eprintln!("failed to spawn the shell: {error}");

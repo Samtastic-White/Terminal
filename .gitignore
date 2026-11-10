@@ -19,8 +19,13 @@ rustc-ice-*.txt
 # Environments
 *.env
 
-# Agent tool local settings (machine-specific, never travels)
-.claude/settings.local.json
+# Agent workspace (local only, never travels)
+.claude
+.agents
+.opencode
+knowledge
+CLAUDE.md
+AGENTS.md
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

@@ -40,7 +40,7 @@ Este proyecto no es una terminal construida al azar: **es un port conceptual dir
                                      ▼  (MIGRACIÓN ARQUITECTÓNICA)
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                        NUESTRA ARQUITECTURA NATIVA                       │
-│   Frontend: GPUI (Zed Engine) ── renderizado directo en Vulkan (~30 MB)  │
+│   Frontend: GPUI (Zed Engine) ── renderizado directo en Vulkan (~70 MB)  │
 │   Backend:  Módulos Rust en memoria (portable-pty) ── canales mpsc       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -69,8 +69,6 @@ La ingeniería interna proviene de la migración de Wave; la interfaz, la estét
 - **Modo Alt-Screen inmersivo** — detección de herramientas interactivas (`vim`, `htop`, `less`): el sistema suspende las tarjetas y cede el 100% del viewport al proceso para evitar redibujados rotos.
 - **Tools Panel** — panel lateral con árbol de archivos del cwd actualizado en tiempo real (vía evento semántico del shell), previsualización y apertura de archivos sin teclear `ls`.
 
-La especificación detallada de cada feature (header con duración y badge de exit code, autocompletado, historial filtrable, splits, pestañas verticales, alternado de pantallas) vive como historias de usuario con criterios de aceptación en **`knowledge/roadmap.md`**.
-
 ---
 
 ## 4. Integración Semántica con el Shell (Zsh + OSC 133)
@@ -84,8 +82,6 @@ Para que el motor sepa cuándo empieza un comando, cuándo termina y qué códig
 | `\e]133;C\e\` | Comando ejecutado: arranca el proceso, se instancia el bloque activo |
 | `\e]133;D;<code>\e\` | Comando finalizado: captura del código de salida y duración |
 | `\e]133;P;Cwd=<ruta>\e\` | Sincronización de directorio para el panel lateral |
-
-El script `precmd`/`preexec` completo y la máquina de estados en Rust: **`knowledge/roadmap.md` § OSC 133 Semantic Protocol**.
 
 ---
 
@@ -124,8 +120,6 @@ El script `precmd`/`preexec` completo y la máquina de estados en Rust: **`knowl
 | 5 | Tools Panel (explorador lateral de archivos) |
 | 6 | Auditoría de rendimiento y memoria (heaptrack, virtualización, < 80 MB) |
 
-Roadmap detallado con criterios de aceptación: **`knowledge/roadmap.md`**.
-
 ---
 
 ## 8. Entorno de Desarrollo (Docker Sandbox)
@@ -140,29 +134,3 @@ mise run clean   # destruir el entorno y liberar espacio
 ```
 
 Verificación estándar dentro del contenedor: `cargo check && cargo clippy -- -D warnings && cargo test`.
-
----
-
-## 9. Mapa de Documentación
-
-| Documento | Qué responde |
-| :--- | :--- |
-| `README.md` / `README.es.md` | **Qué es el producto**: README canónico en inglés + traducción al español |
-| `knowledge/roadmap.md` | **Qué queda por hacer**: backlog por fases con user stories y criterios de aceptación |
-| `knowledge/architecture.md` | **Dónde vive cada cosa**: capas limpias, lifecycles, tabla Change Mapping |
-| `knowledge/conventions.md` | **Cómo se escribe el código**: estándares Rust, clippy estricto, memoria |
-| `knowledge/project-map.md` | **Cómo navegar el repo**: de petición a archivo |
-| `knowledge/governance/` | **Qué reglas rigen y por qué**: políticas, constitución, ADRs |
-| `knowledge/specs/<capacidad>/` | Especificaciones gated de capacidades (Spec-Driven Development) |
-| `AGENTS.md` | Instrucciones operativas para agentes IA y CLIs (fuente única) |
-
-> **Para agentes IA / herramientas CLI:** el punto de entrada único es `AGENTS.md` — se autocarga en cada sesión y define las reglas operativas, el mapa de contexto por capas de carga y los comandos de verificación. Claude Code lo descubre vía `CLAUDE.md` (shim); las skills del flujo viven en `.agents/skills/` con shims en `.claude/skills/`.
-
----
-
-## 10. Referencias de Arquitectura y Código Fuente
-
-- **Zed Industries** (`zed-industries/zed`): referencia obligatoria para comprender el ciclo de vida de `gpui` — entidades (`Entity`), modelos y vistas reactivas en Rust nativo.
-- **Wave Terminal** (`wavetermdev/waveterm`): referencia para el modelo de datos de bloques (`BlockController`), el soporte de previsualización de archivos y el tratamiento de comandos interactivos.
-- **Warp Terminal** (`warpdotdev/warp`): referencia visual y de experiencia de usuario: acciones por bloque, sticky scroll y diseño del editor de comandos.
-- **WezTerm** (`wez/wezterm`): referencia directa para el uso robusto de `portable-pty` y la implementación del estándar semántico OSC 133.

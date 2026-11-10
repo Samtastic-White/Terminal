@@ -1,7 +1,7 @@
-//! Input Editor — native GPUI multi-line editor (Phase 1: basic passthrough).
+//! Native GPUI multi-line input editor.
 //!
-//! Handles printable keys, Enter, Backspace, Ctrl+C, Ctrl+D, Ctrl+L, arrows.
-//! Routes keystrokes to Application layer via callback.
+//! Handles printable keys, Enter, Backspace, Ctrl+C, Ctrl+D, Ctrl+L, and
+//! arrows; routes keystrokes through callbacks.
 
 use gpui::*;
 use crate::presentation::theme::TerminalTheme;
@@ -9,7 +9,6 @@ use crate::presentation::theme::colors;
 use crate::common::errors::Result;
 use std::sync::Arc;
 
-/// Simple input buffer for Phase 1 passthrough
 struct InputBuffer {
     content: String,
     cursor_pos: usize,
@@ -29,7 +28,6 @@ impl InputBuffer {
 
     fn backspace(&mut self) {
         if self.cursor_pos > 0 {
-            // Find previous char boundary
             let prev = self.content[..self.cursor_pos].chars().rev().next();
             if let Some(c) = prev {
                 let char_len = c.len_utf8();
@@ -41,14 +39,12 @@ impl InputBuffer {
 
     fn take_line(&mut self) -> Option<String> {
         if self.content.contains('\n') {
-            // Multi-line: take up to first newline
             let idx = self.content.find('\n').unwrap();
             let line = self.content[..idx].to_string();
             self.content.drain(..=idx);
             self.cursor_pos = 0;
             Some(line)
         } else if !self.content.is_empty() {
-            // Single line: take all on Enter
             let line = std::mem::take(&mut self.content);
             self.cursor_pos = 0;
             Some(line)
@@ -58,7 +54,6 @@ impl InputBuffer {
     }
 }
 
-/// InputEditor component — handles keyboard input and renders current buffer
 pub struct InputEditor {
     focus_handle: FocusHandle,
     buffer: InputBuffer,
@@ -89,7 +84,6 @@ impl InputEditor {
         }
     }
 
-    /// Get the current input text (for rendering)
     fn current_input(&self) -> &str {
         &self.buffer.content
     }
@@ -106,7 +100,6 @@ impl Render for InputEditor {
         let input_text = self.current_input().to_string();
         let cursor_pos = self.buffer.cursor_pos;
 
-        // Build cursor position visual
         let (before_cursor, after_cursor) = input_text.split_at(cursor_pos.min(input_text.len()));
 
         let mut root = div()
@@ -140,7 +133,6 @@ impl Render for InputEditor {
                                     .items_baseline()
                                     .child(before_cursor)
                                     .child(
-                                        // Cursor block
                                         div()
                                             .id("cursor")
                                             .w(px(2.0))
@@ -161,13 +153,11 @@ impl Render for InputEditor {
 }
 
 impl InputEditor {
-    /// Handle key down events
     pub fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         let key = keystroke.key;
 
-        // Ctrl combinations
         if modifiers.control {
             match key {
                 Key::Character(c) if c == "c" => {
@@ -186,14 +176,12 @@ impl InputEditor {
             }
         }
 
-        // Regular keys
         match key {
             Key::Enter => {
                 if let Some(line) = self.buffer.take_line() {
                     let line_with_newline = format!("{}\r", line);
                     let _ = (self.on_submit)(line_with_newline);
                 } else {
-                    // Empty Enter - send just CR
                     let _ = (self.on_submit)("\r".to_string());
                 }
             }
@@ -201,14 +189,12 @@ impl InputEditor {
                 self.buffer.backspace();
             }
             Key::Character(c) => {
-                // Printable character
                 if c.len() == 1 {
                     self.buffer.insert_char(c.chars().next().unwrap());
                 }
             }
             Key::ArrowLeft => {
                 if self.buffer.cursor_pos > 0 {
-                    // Move back one char boundary
                     let before = &self.buffer.content[..self.buffer.cursor_pos];
                     if let Some(last_char) = before.chars().rev().next() {
                         self.buffer.cursor_pos -= last_char.len_utf8();
@@ -222,8 +208,7 @@ impl InputEditor {
                 }
             }
             Key::ArrowUp | Key::ArrowDown => {
-                // Arrow keys: send as CSI sequences (plain CSI, not SS3)
-                // Phase 1: simple CSI encoding
+                // Plain CSI, not SS3.
                 let seq = match key {
                     Key::ArrowUp => "\x1b[A",
                     Key::ArrowDown => "\x1b[B",

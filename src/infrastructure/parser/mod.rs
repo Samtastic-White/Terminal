@@ -1,60 +1,53 @@
-//! `src/infrastructure/parser/` — `BlockTextWriter`.
+//! `BlockTextWriter` — bounded `vte::Perform` implementation.
 //!
-//! A bounded `vte::Perform` implementation ("block text writer") that
-//! interprets normal-mode output: plain text, CR/LF/BS/HT, 16-/256-/24-bit
-//! SGR colors, style attributes, `EL`/`ED`, auto-wrap at PTY width, and
-//! cursor tracking sufficient for `\r` rewrites (spec
-//! `knowledge/specs/pty-raw-output/spec.md` BR-5; design
-//! `knowledge/specs/pty-raw-output/design.md` § writer/data model).
+//! Interprets normal-mode output: plain text, CR/LF/BS/HT, 16/256/24-bit SGR
+//! colors, style attributes, `EL`/`ED`, auto-wrap at PTY width, and cursor
+//! tracking sufficient for `\r` rewrites.
 //!
-//! Scope boundary (roadmap Decision 2026-11-07, dual engine): the full
-//! terminal-grid state machine is NEVER hand-rolled here. Phase 4 adopts a
-//! proven crate behind a Domain port and plugs into
-//! `BlockTextWriter::resize_cols`. Everything outside the subset is
-//! consumed silently: never printed, never panicked on (BR-6).
+//! The full terminal-grid state machine is never hand-rolled here. Everything
+//! outside this subset is consumed silently: never printed, never panicked on.
 
 use std::collections::VecDeque;
 
 use unicode_width::UnicodeWidthChar;
 use vte::{Parser, Perform};
 
-use crate::domain::interpreter::TextInterpreterPort;
 use crate::domain::output::{Color, Row, Span, TextStyle};
+use crate::domain::size::TerminalSize;
+use crate::domain::terminal_surface::TerminalSurfacePort;
 
-/// HT advances to the next multiple of this stop (design § 4; VT
-/// convention).
+/// HT advances to the next multiple of this stop (VT convention).
 const TAB_STOP: usize = 8;
 
-/// The subset interpreter proper. Kept separate from `BlockTextWriter` so
-/// `write()` can split-borrow the persist `vte::Parser` and this state
-/// across one `advance` call.
+/// The subset interpreter. Kept separate from `BlockTextWriter` so `write()`
+/// can split-borrow the persistent `vte::Parser` and this state across one
+/// `advance` call.
 #[derive(Debug)]
 struct Core {
     /// PTY width in columns. New bytes wrap here; stored rows keep their
-    /// creation-time width (BR-7).
+    /// creation-time width.
     cols: usize,
-    /// Active SGR style; applies from the next printed character on (the
-    /// SGR change is instantaneous: no retroactive restyling).
+    /// Active SGR style. Applies from the next printed character; no
+    /// retroactive restyling.
     style: TextStyle,
-    /// Cursor column of the active row. Only the current row is tracked
-    /// (BR-5 cursor subset).
+    /// Cursor column of the active row. Only the current row is tracked.
     col: usize,
     /// VT100 deferred auto-wrap: set after printing at the last column;
-    /// cleared by any explicit cursor motion (CR/BS/HT) or a newline.
+    /// cleared by explicit cursor motion or a newline.
     pending_wrap: bool,
-    /// Addressable cells of the active row; `None` = never written.
-    /// Bounded by `cols` — plus mid-rewrite leftovers.
+    /// Addressable cells of the active row; `None` means never written.
+    /// Bounded by `cols` plus mid-rewrite leftovers.
     active: Vec<Option<ActiveCell>>,
     /// Completed rows awaiting transport to the session document.
     committed: VecDeque<Row>,
 }
 
-/// One addressable character of the active row plus the style it was
-/// printed with (in-place rewrites overwrite cells, never spans).
+/// One addressable character of the active row plus the style it was printed
+/// with. In-place rewrites overwrite cells, never spans.
 ///
-/// `cont` marks continuing columns of a wide (2-column) glyph: fold
-/// emits the character once (its head cell) and skips continuations —
-/// the second slot exists only to consume display columns.
+/// `cont` marks continuation columns of a wide glyph: fold emits the character
+/// once at its head cell and skips continuations, which exist only to consume
+/// display columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActiveCell {
     ch: char,
@@ -63,15 +56,12 @@ struct ActiveCell {
 }
 
 impl Core {
-    /// Fold the active row into finished spans and retire it.
+    /// Folds the active row into finished spans and retires it.
     ///
-    /// An all-unwritten row still commits (as an empty `Row`): double LF
-    /// is real blank-line content. Unwritten interior/leading columns are
-    /// padded as plain blanks — they are the positions the terminal
-    /// displayed empty (staircase LF, tab stops); trailing unwritten
-    /// cells beyond the last write are dropped. Historic cells beyond a
-    /// rewrite stay — `\r` moves the cursor but does not erase (spec
-    /// pin).
+    /// An all-unwritten row still commits as an empty `Row`: double LF is real
+    /// blank-line content. Unwritten leading and interior columns are padded
+    /// as plain blanks; trailing unwritten cells are dropped. Historic cells
+    /// beyond a rewrite stay: `\r` moves the cursor but does not erase.
     fn commit(&mut self) {
         let last_written = self.active.iter().rposition(|cell| cell.is_some());
         let Some(last) = last_written else {
@@ -86,14 +76,12 @@ impl Core {
         let mut run_text = String::new();
 
         for cell in self.active.drain(..=last) {
-            // Padding unwritten columns: only up to the last written one.
             let cell = cell.unwrap_or(ActiveCell {
                 ch: ' ',
                 style: TextStyle::default(),
                 cont: false,
             });
-            // Continuation column of a wide glyph: the character was
-            // already emitted by its head.
+            // Continuation columns were already emitted by their head cell.
             if cell.cont {
                 continue;
             }
@@ -120,22 +108,19 @@ impl Core {
         self.pending_wrap = false;
     }
 
-    /// Print one character with deferred auto-wrap semantics.
+    /// Prints one character with deferred auto-wrap semantics.
     ///
-    /// - zero-width characters (combining/ZWJ) are dropped: a documented
-    ///   non-goal of this phase (spec edge cases);
-    /// - a character at the last column stays in place — `pending_wrap`,
-    ///   the next printable char commits the row first;
-    /// - a wide character that straddles the boundary commits the row
-    ///   before placing (xterm behavior).
+    /// Zero-width characters (combining, ZWJ) are dropped. A character at the
+    /// last column stays in place with `pending_wrap`; the next printable char
+    /// commits the row first. A wide character that straddles the boundary
+    /// commits the row before placing (xterm behavior).
     fn print(&mut self, c: char) {
         let Some(w) = c.width() else { return };
         if w == 0 {
             return;
         }
         if w > self.cols {
-            // A single glyph wider than the whole PTY cannot be placed:
-            // deterministic degrade (BR-6), never a panic.
+            // A glyph wider than the PTY cannot be placed: degrade, never panic.
             return;
         }
         if self.pending_wrap {
@@ -162,9 +147,7 @@ impl Core {
             self.active.resize(end, None);
         }
         if w == 1 {
-            // Overwriting part of a wide glyph leaves no half-glyph
-            // behind: clear the orphaned mate (degenerate overlay cases
-            // still degrade deterministically, spec BR-6).
+            // Never leave half a wide glyph behind: clear the orphaned mate.
             if let Some(cell) = self.active.get(start).copied().flatten()
                 && cell.cont
                 && start > 0
@@ -189,10 +172,9 @@ impl Core {
         }
     }
 
-    /// Erase a cell range painting with the background of the active
-    /// style at erase time (spec edge cases). Open-ended `to_inclusive`
-    /// values clamp at the last written cell — erasing past the cursor
-    /// (nothing there) is a no-op, and never erases backwards.
+    /// Erases a cell range painting with the background of the active style
+    /// at erase time. `to_inclusive` values clamp at the last written cell;
+    /// erasing past the cursor is a no-op and never erases backwards.
     fn erase(&mut self, from: usize, to_inclusive: usize) {
         let Some(last) = self.active.iter().rposition(|cell| cell.is_some()) else {
             return;
@@ -228,9 +210,9 @@ impl Core {
         }
     }
 
-    /// `CSI J` — erase on the current logical row only (this writer has
-    /// no grid: regions above/below are not materialized; ED 3
-    /// scrollback-clear is ignored).
+    /// `CSI J` — erases only the current logical row; this writer has no grid,
+    /// so regions above and below are not materialized. ED 3 (scrollback
+    /// clear) is ignored.
     fn erase_in_display(&mut self, mode: u16) {
         match mode {
             0 => self.erase_in_line(0),
@@ -240,9 +222,9 @@ impl Core {
         }
     }
 
-    /// SGR dispatch with full `38;5;n` / `38;2;r;g;b` (and bg twins)
-    /// parameter traversal; incomplete color sequences are consumed
-    /// without altering state (BR-6).
+    /// SGR dispatch with full `38;5;n` / `38;2;r;g;b` (and background twins)
+    /// parameter traversal. Incomplete color sequences are consumed without
+    /// altering state.
     fn sgr(&mut self, params: &vte::Params) {
         let flat: Vec<u16> = params.iter().flatten().copied().collect();
         if flat.is_empty() {
@@ -259,8 +241,8 @@ impl Core {
         }
     }
 
-    /// Apply one SGR parameter, returning how many flat pieces it
-    /// consumed (color forms eat their arguments).
+    /// Applies one SGR parameter, returning how many flat pieces it consumed
+    /// (color forms eat their arguments).
     fn apply_sgr(&mut self, rest: &[u16]) -> usize {
         match rest[0] {
             0 => {
@@ -299,9 +281,8 @@ impl Core {
                             self.style.set_color(which, Color::Indexed(idx as u8));
                             3
                         }
-                        // Incomplete color form: the whole sequence was
-                        // malformed — consume its remainder, no state
-                        // change (BR-6).
+                        // Incomplete color form: consume the remainder,
+                        // state unchanged.
                         None => rest.len(),
                     },
                     Some(&2) => match (rest.get(2), rest.get(3), rest.get(4)) {
@@ -319,9 +300,8 @@ impl Core {
                         // Incomplete RGB form: consume the remainder.
                         _ => rest.len(),
                     },
-                    // Malformed (missing/wrong mode): the whole sequence
-                    // was broken — consume the remainder, state unchanged
-                    // (BR-6).
+                    // Malformed (missing or wrong mode): consume the
+                    // remainder, state unchanged.
                     _ => rest.len(),
                 }
             }
@@ -349,8 +329,8 @@ impl Core {
                 self.style.bg = Color::Default;
                 1
             }
-            // Everything else (blink, reverse, fonts, underline styles…)
-            // is outside the subset: ignored (BR-5).
+            // Outside the subset (blink, reverse, fonts, underline styles):
+            // ignored.
             _ => 1,
         }
     }
@@ -377,8 +357,7 @@ impl TextStyle {
     }
 }
 
-/// The `vte::Perform` subset. Everything not named in BR-5 lands in a
-/// no-op with a pointer at its Phase 4 owner (design § 10).
+/// The `vte::Perform` subset. Everything outside it is a no-op.
 impl Perform for Core {
     fn print(&mut self, c: char) {
         self.print(c);
@@ -386,31 +365,30 @@ impl Perform for Core {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            // CR: carriage return, column 0 — the progress-bar engine.
+            // Carriage return: column 0, the progress-bar engine.
             b'\r' => {
                 self.col = 0;
                 self.pending_wrap = false;
             }
-            // LF (and VT/FF behaving like LF): commit the row, keep the
-            // column (a bare `\n` staircases by design; shells emit CRLF).
+            // LF (and VT/FF): commit the row, keep the column. A bare `\n`
+            // staircases; shells emit CRLF.
             b'\n' | 0x0B | 0x0C => {
                 self.commit();
                 self.col = self.col.min(self.cols.saturating_sub(1));
             }
-            // BS: one column left, floor 0.
+            // Backspace: one column left, floor 0.
             0x08 => {
                 self.pending_wrap = false;
                 self.col = self.col.saturating_sub(1);
             }
-            // HT: snap to the next multiple-of-8 stop, clipped at the
-            // last printable column (cursor movement never triggers a
-            // wrap by itself).
+            // Tab: next multiple-of-8 stop, clipped at the last printable
+            // column. Cursor movement never wraps by itself.
             0x09 => {
                 let stop = (self.col / TAB_STOP + 1) * TAB_STOP;
                 self.col = stop.min(self.cols.saturating_sub(1));
                 self.pending_wrap = false;
             }
-            // BEL and every other C0: outside the subset, ignored (BR-5).
+            // BEL and every other C0: outside the subset, ignored.
             _ => {}
         }
     }
@@ -423,7 +401,7 @@ impl Perform for Core {
         action: char,
     ) {
         if ignore || !intermediates.is_empty() {
-            return; // Malformed/unsupported: consumed silently (BR-6).
+            return; // Malformed or unsupported: consumed silently.
         }
         match action {
             'K' => {
@@ -443,13 +421,13 @@ impl Perform for Core {
                 self.erase_in_display(mode);
             }
             'm' => self.sgr(params),
-            // CUP/CUC/CUD/CUU/SU/DECSET…: Phase 4 grid engine (design § 10).
+            // Cursor addressing and grid sequences stay out of this subset.
             _ => {}
         }
     }
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        // OSC (including future 133 markers) absorbed silently (BR-5).
+        // OSC (including 133 markers) is absorbed silently.
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _action: u8) {
@@ -457,19 +435,18 @@ impl Perform for Core {
     }
 }
 
-/// Public writer: consumes raw child bytes (chunked at PTY-read
-/// boundaries — mid-sequence splits included: the `vte` FSM is
-/// stateful) and yields committed styled rows.
+/// Consumes raw child bytes chunked at PTY-read boundaries (mid-sequence
+/// splits included: the `vte` FSM is stateful) and yields committed styled
+/// rows.
 ///
-/// No `Debug`: the inner `vte::Parser` does not implement it and the
-/// writer's observable state is exactly the row stream.
+/// No `Debug`: the inner `vte::Parser` does not implement it, and the writer's
+/// observable state is exactly the row stream.
 pub struct BlockTextWriter {
     parser: Parser,
     core: Core,
 }
 
 impl BlockTextWriter {
-    /// Builds the writer for a PTY width of `cols` columns.
     pub fn new(cols: u16) -> Self {
         Self {
             parser: Parser::new(),
@@ -484,34 +461,32 @@ impl BlockTextWriter {
         }
     }
 
-    /// Current wrap width (PTY cols).
     #[allow(dead_code)]
     pub fn cols(&self) -> u16 {
         self.core.cols as u16
     }
 
-    /// Resize path (spec BR-7): new bytes wrap at the new width. Already
-    /// stored rows are NOT re-wrapped (no reflow this phase); the active
-    /// row keeps its content truncated at the new width.
+    /// New bytes wrap at the new width. Already stored rows are never
+    /// re-wrapped; the active row is truncated at the new width.
     #[allow(dead_code)]
     pub fn resize_cols(&mut self, cols: u16) {
         self.core.resize_cols(cols);
     }
 
-    /// Consume a raw chunk. Designed for the PTY reader's bounded chunks:
-    /// UTF-8 multibyte sequences split across calls reassemble.
+    /// Consumes a raw chunk. UTF-8 multibyte sequences split across calls
+    /// reassemble.
     pub fn write(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.core, bytes);
     }
 
-    /// Drain completed rows for transport (the caller hands them to the
-    /// Application session document, which enforces the line cap).
+    /// Drains completed rows for transport; the application document enforces
+    /// the line cap.
     pub fn take_committed_rows(&mut self) -> Vec<Row> {
         self.core.committed.drain(..).collect()
     }
 
-    /// EOF finalization (spec BR-9): flushes the last partially built
-    /// row, but fabricates nothing for a fully unwritten row.
+    /// Flushes the last partially built row. A fully unwritten row
+    /// fabricates nothing.
     pub fn flush_active_row(&mut self) {
         if self.core.active.iter().any(|cell| cell.is_some()) {
             self.core.commit();
@@ -531,17 +506,16 @@ impl Core {
     }
 }
 
-impl TextInterpreterPort for BlockTextWriter {
+impl TerminalSurfacePort for BlockTextWriter {
     fn interpret(&mut self, bytes: &[u8]) -> Vec<Row> {
         self.write(bytes);
         self.take_committed_rows()
     }
 
-    fn resize_cols(&mut self, cols: u16) {
-        // Direct on Core: an inherent self-call with the same name would
-        // recurse through the port method (they share the name by
-        // contract design).
-        self.core.resize_cols(cols);
+    fn resize(&mut self, size: TerminalSize) {
+        // Direct on Core: an inherent method with the same name would recurse
+        // through the port method.
+        self.core.resize_cols(size.cols);
     }
 
     fn flush(&mut self) -> Vec<Row> {
@@ -557,7 +531,6 @@ mod golden;
 mod tests {
     use super::*;
 
-    /// Feed chunks, finalize (EOF flush), collect rows.
     fn rows_of(cols: u16, chunks: &[&[u8]]) -> Vec<Row> {
         let mut writer = BlockTextWriter::new(cols);
         for chunk in chunks {
@@ -570,8 +543,6 @@ mod tests {
     fn text(row: &Row) -> String {
         row.spans.iter().map(|span| span.text.as_str()).collect()
     }
-
-    // ----- T2: text, C0 controls, pending-wrap -----
 
     #[test]
     fn plain_text_single_row() {
@@ -635,8 +606,6 @@ mod tests {
         // \r moves the cursor but does not erase: X overwrites 'h'.
         assert_eq!(rows.iter().map(text).collect::<Vec<_>>(), ["Xello"]);
     }
-
-    // ----- T3: SGR colors/attributes, EL/ED -----
 
     #[test]
     fn sgr_basic_16_foreground() {
@@ -747,8 +716,8 @@ mod tests {
     fn resize_updates_wrap_width_for_new_bytes() {
         let mut writer = BlockTextWriter::new(10);
         writer.write(b"verylongline\r\n");
-        // 12 columns of text wrap at width 10 into two committed rows;
-        // they keep their creation-time width (no reflow, BR-7).
+        // 12 columns of text wrap at width 10 into two committed rows that
+        // keep their creation-time width.
         let rows = writer.take_committed_rows();
         assert_eq!(
             rows.iter().map(text).collect::<Vec<_>>(),
@@ -758,7 +727,6 @@ mod tests {
         writer.resize_cols(40);
         assert_eq!(writer.cols(), 40);
         writer.write(b"short\n");
-        // New bytes wrap at the NEW width — "short" fits in one row.
         let rows = writer.take_committed_rows();
         assert_eq!(rows.iter().map(text).collect::<Vec<_>>(), ["short"]);
     }

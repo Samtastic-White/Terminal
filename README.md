@@ -40,7 +40,7 @@ This project is not a terminal built at random: **it is a direct conceptual port
                                      ▼  (ARCHITECTURAL MIGRATION)
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                        OUR NATIVE ARCHITECTURE                           │
-│   Frontend: GPUI (Zed Engine) ── direct Vulkan rendering (~30 MB)        │
+│   Frontend: GPUI (Zed Engine) ── direct Vulkan rendering (~70 MB)        │
 │   Backend:  In-memory Rust modules (portable-pty) ── mpsc channels       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -69,8 +69,6 @@ The internal engineering comes from the Wave migration; the interface, aesthetic
 - **Immersive Alt-Screen mode** — detection of interactive tools (`vim`, `htop`, `less`): the system suspends cards and gives 100% of the viewport to the process to avoid broken redraws.
 - **Tools Panel** — sidebar with a file tree of the current cwd updated in real time (via the shell's semantic event), file preview, and file opening without typing `ls`.
 
-The detailed specification of each feature (header with duration and exit-code badge, autocomplete, filterable history, splits, vertical tabs, alternate-screen switching) lives as user stories with acceptance criteria in **`knowledge/roadmap.md`**.
-
 ---
 
 ## 4. Semantic Shell Integration (Zsh + OSC 133)
@@ -84,8 +82,6 @@ So the engine knows when a command starts, when it ends, and what code it produc
 | `\e]133;C\e\` | Command executed: process starts, active block is instantiated |
 | `\e]133;D;<code>\e\` | Command finished: exit code and duration captured |
 | `\e]133;P;Cwd=<path>\e\` | Directory sync for the sidebar panel |
-
-The full `precmd`/`preexec` script and the Rust state machine: **`knowledge/roadmap.md` § OSC 133 Semantic Protocol**.
 
 ---
 
@@ -124,8 +120,6 @@ The full `precmd`/`preexec` script and the Rust state machine: **`knowledge/road
 | 5 | Tools Panel (sidebar file explorer) |
 | 6 | Performance and memory audit (heaptrack, virtualization, < 80 MB) |
 
-Detailed roadmap with acceptance criteria: **`knowledge/roadmap.md`**.
-
 ---
 
 ## 8. Development Environment (Docker Sandbox)
@@ -140,29 +134,3 @@ mise run clean   # destroy the environment and free space
 ```
 
 Standard verification inside the container: `cargo check && cargo clippy -- -D warnings && cargo test`.
-
----
-
-## 9. Documentation Map
-
-| Document | What It Answers |
-| :--- | :--- |
-| `README.md` / `README.es.md` | **What the product is**: canonical English README + Spanish translation |
-| `knowledge/roadmap.md` | **What is left to do**: phased backlog with user stories and acceptance criteria |
-| `knowledge/architecture.md` | **Where everything lives**: clean layers, lifecycles, Change Mapping table |
-| `knowledge/conventions.md` | **How code is written**: Rust standards, strict clippy, memory |
-| `knowledge/project-map.md` | **How to navigate the repo**: from request to file |
-| `knowledge/governance/` | **Which rules govern and why**: policies, constitution, ADRs |
-| `knowledge/specs/<capability>/` | Gated capability specifications (Spec-Driven Development) |
-| `AGENTS.md` | Operational instructions for AI agents and CLIs (single source) |
-
-> **For AI agents / CLI tools:** the single entry point is `AGENTS.md` — it self-loads on every session and defines the operating rules, the context-load tier map, and the verification commands. Claude Code discovers it via `CLAUDE.md` (shim); the workflow skills live in `.agents/skills/` with shims in `.claude/skills/`.
-
----
-
-## 10. Architecture and Source Code References
-
-- **Zed Industries** (`zed-industries/zed`): mandatory reference for understanding the `gpui` lifecycle — entities (`Entity`), models, and reactive views in native Rust.
-- **Wave Terminal** (`wavetermdev/waveterm`): reference for the block data model (`BlockController`), file preview support, and interactive command handling.
-- **Warp Terminal** (`warpdotdev/warp`): visual and UX reference: per-block actions, sticky scroll, and command editor design.
-- **WezTerm** (`wez/wezterm`): direct reference for robust use of `portable-pty` and implementation of the OSC 133 semantic standard.

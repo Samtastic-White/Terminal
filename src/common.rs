@@ -1,3 +1,3 @@
-//! Cross-cutting shared primitives (`knowledge/architecture.md` § 5).
+//! Cross-cutting shared primitives.
 
 pub mod errors;

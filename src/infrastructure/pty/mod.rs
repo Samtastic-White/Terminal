@@ -1,11 +1,9 @@
-//! `src/infrastructure/pty/` — `PtyAdapter` implements the Domain
-//! `PtyPort` with `portable-pty` (design.md § 2 contracts, § 3 flow).
+//! `PtyAdapter` implements the domain `PtyPort` with `portable-pty`.
 //!
-//! Threading contract (spec BR-2/BR-3): reads run on a dedicated OS
-//! thread; chunks travel through a bounded `SyncSender` whose `send`
-//! blocks when full — the reader parks and the kernel pipe buffer
-//! throttles the child. **PTY bytes are never dropped.** EOF marks the
-//! session ended and reaps the child (no zombies — design § 8).
+//! Reads run on a dedicated OS thread. Chunks travel through a bounded
+//! `SyncSender` whose `send` blocks when full: the reader parks and the kernel
+//! pipe buffer throttles the child. PTY bytes are never dropped. EOF marks the
+//! session ended and reaps the child, leaving no zombie.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,21 +13,19 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, native_pty_system};
 
 use crate::common::errors::{Result, TerminalError};
-use crate::domain::pty::{PtyPort, PtySize};
+use crate::domain::pty::PtyPort;
+use crate::domain::size::TerminalSize;
 
-/// Reader chunk size (design § 4).
 const PTY_BUFFER_BYTES: usize = 8 * 1024;
-/// Bounded channel capacity in chunks (design § 4). ≈ 512 KiB in flight.
+/// Bounded channel capacity in chunks (about 512 KiB in flight).
 const CHANNEL_CAP: usize = 64;
-/// Production child shell (spec BR-1).
 const ZSH_PATH: &str = "/bin/zsh";
 
-/// `TerminalError::Pty` conversion helper for portable-pty failures.
 fn pty_err<E: std::fmt::Display>(error: E) -> TerminalError {
     TerminalError::Pty(error.to_string())
 }
 
-/// The live PTY session. One window spawns exactly one adapter (BR-1).
+/// The live PTY session. One window spawns exactly one adapter.
 pub struct PtyAdapter {
     shell_path: &'static str,
     master: Option<Box<dyn MasterPty + Send>>,
@@ -50,14 +46,14 @@ impl Default for PtyAdapter {
 }
 
 impl PtyAdapter {
-    /// Adapter for `/bin/zsh`, engine-gated from this phase on
-    /// (`NATIVE_TERMINAL=1` so the Phase 2 Zsh hooks can activate later
-    /// without a protocol change).
+    /// Adapter for `/bin/zsh`; the shell environment carries
+    /// `NATIVE_TERMINAL=1`.
     pub fn new() -> Self {
         Self::with_shell(ZSH_PATH)
     }
 
-    /// explicit shell path (tests: failure-path and integration runs).
+    /// Adapter with an explicit shell path (tests: failure path and
+    /// integration runs).
     pub fn with_shell(shell_path: &'static str) -> Self {
         Self {
             shell_path,
@@ -87,10 +83,10 @@ impl PtyAdapter {
 }
 
 impl PtyPort for PtyAdapter {
-    /// Spawn `/bin/zsh` in a new PTY sized to `size`, start the reader
-    /// thread, and stash the receiver for `take_output`. Idempotent while
-    /// a live session exists (BR-1).
-    fn spawn(&mut self, size: PtySize) -> Result<()> {
+    /// Spawns the shell in a new PTY sized to `size`, starts the reader
+    /// thread, and stashes the receiver for `take_output`. Idempotent while a
+    /// live session exists.
+    fn spawn(&mut self, size: TerminalSize) -> Result<()> {
         if self.spawned && self.is_alive() {
             return Ok(());
         }
@@ -109,9 +105,9 @@ impl PtyPort for PtyAdapter {
         let reader = master.try_clone_reader().map_err(pty_err)?;
         let writer = master.take_writer().map_err(pty_err)?;
 
-        // Reader worker (BR-2): blocking reads are legal here — this is
-        // never the render thread. `send` blocks on a full bounded
-        // channel (BR-3): the kernel pipe then throttles the child.
+        // Blocking reads are legal here: this is never the render thread.
+        // `send` blocks on a full bounded channel, so the kernel pipe
+        // throttles the child.
         let (sender, receiver) = sync_channel::<Vec<u8>>(CHANNEL_CAP);
         let reaper = self.child.clone();
         let reader_alive = self.reader_alive.clone();
@@ -139,7 +135,7 @@ impl PtyPort for PtyAdapter {
                 }
                 drop(sender);
                 reader_alive.store(false, Ordering::Relaxed);
-                // Reap the child: no zombie (design § 8).
+                // Reap the child: no zombie.
                 if let Ok(mut guard) = reaper.lock()
                     && let Some(mut child) = guard.take()
                 {
@@ -158,7 +154,7 @@ impl PtyPort for PtyAdapter {
         Ok(())
     }
 
-    /// Complete short writes before returning (design § 2 contract).
+    /// Completes short writes before returning.
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -170,9 +166,9 @@ impl PtyPort for PtyAdapter {
         writer.flush().map_err(pty_err)
     }
 
-    /// Immediate resize; the kernel SIGWINCH reaches the foreground
-    /// group (BR-7 — callers must not debounce).
-    fn resize(&mut self, size: PtySize) -> Result<()> {
+    /// Immediate resize; the kernel SIGWINCH reaches the foreground group.
+    /// Callers must not debounce.
+    fn resize(&mut self, size: TerminalSize) -> Result<()> {
         let Some(master) = self.master.as_ref() else {
             return Err(TerminalError::Pty("session not spawned".into()));
         };
@@ -232,7 +228,7 @@ mod tests {
     #[test]
     fn bytes_round_trip_through_spawned_shell() {
         let mut adapter = PtyAdapter::new();
-        adapter.spawn(PtySize::new(80, 24)).unwrap();
+        adapter.spawn(TerminalSize::new(80, 24)).unwrap();
         let mut receiver = adapter.take_output().unwrap();
 
         // Drain the banner noise until the prompt settles.
@@ -246,8 +242,7 @@ mod tests {
 
     #[test]
     fn full_channel_blocks_the_reader_no_bytes_dropped() {
-        // The windpark/backpressure seam (design § 7): a full sync channel
-        // must park `send`, then release on drain.
+        // A full channel must park `send` until the consumer drains.
         let (sender, receiver) = sync_channel::<Vec<u8>>(1);
         sender.send(vec![1]).unwrap();
 
@@ -275,7 +270,7 @@ mod tests {
     #[test]
     fn eof_marks_session_ended() {
         let mut adapter = PtyAdapter::new();
-        adapter.spawn(PtySize::new(80, 24)).unwrap();
+        adapter.spawn(TerminalSize::new(80, 24)).unwrap();
         let receiver = adapter.take_output().unwrap();
 
         adapter.write(b"exit\r").unwrap();
@@ -290,14 +285,14 @@ mod tests {
             )
             .is_ok()
         {}
-        assert!(!adapter.is_alive(), "EOF must finish the session (BR-9)");
+        assert!(!adapter.is_alive(), "EOF must finish the session");
     }
 
     #[test]
     fn spawn_failure_maps_to_terminal_error() {
         let mut adapter = PtyAdapter::with_shell("/nonexistent-shell-9f3ad1");
         let error = adapter
-            .spawn(PtySize::new(80, 24))
+            .spawn(TerminalSize::new(80, 24))
             .expect_err("missing shell must fail");
         assert!(matches!(error, TerminalError::Pty(_)));
     }

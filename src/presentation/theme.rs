@@ -2,13 +2,12 @@
 
 use gpui::*;
 
-/// Catppuccin Mocha palette (base terminal colors). The full token set stays
-/// available for later phases even when Phase 1 only reads a subset.
+/// Catppuccin Mocha palette. The full token set stays available even when
+/// only a subset is read.
 #[allow(dead_code)]
 pub mod colors {
     use gpui::Rgba;
 
-    /// Build an opaque color from its 8-bit channels (const-friendly).
     pub const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
         Rgba {
             r: r as f32 / 255.0,
@@ -18,7 +17,6 @@ pub mod colors {
         }
     }
 
-    /// Build an opaque color from a `0xRRGGBB` literal.
     pub const fn hex(value: u32) -> Rgba {
         let [_, r, g, b] = value.to_be_bytes();
         rgb(r, g, b)
@@ -72,7 +70,6 @@ pub mod colors {
     ];
 }
 
-/// Terminal-specific theme configuration.
 #[derive(Clone)]
 pub struct TerminalTheme {
     pub background: Rgba,
@@ -101,7 +98,6 @@ impl Default for TerminalTheme {
 }
 
 impl TerminalTheme {
-    /// Convert a domain foreground color to a GPUI color.
     pub fn resolve_color(&self, color: &crate::domain::output::Color) -> Rgba {
         use crate::domain::output::Color;
         match color {
@@ -111,8 +107,8 @@ impl TerminalTheme {
         }
     }
 
-    /// Convert a domain background color to a GPUI color. `Default` means
-    /// "terminal background", i.e. no per-span paint.
+    /// Converts a domain background color to a GPUI color. `Default` means the
+    /// terminal background, i.e. no per-span paint.
     pub fn resolve_bg(&self, color: &crate::domain::output::Color) -> Option<Rgba> {
         match color {
             crate::domain::output::Color::Default => None,

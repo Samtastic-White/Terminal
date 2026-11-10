@@ -1,18 +1,15 @@
-//! Application-wide error type (`knowledge/conventions.md` § Error
-//! Handling).
+//! Application-wide error type.
 //!
-//! Infrastructure failures are converted into these variants at the
-//! infrastructure boundary; Domain logic models impossible states away
-//! with types and never produces errors.
+//! Infrastructure failures convert into these variants at the infrastructure
+//! boundary; Domain models impossible states away with types and never
+//! produces errors.
 
 use std::fmt;
 
-/// Single application error type. Fallible APIs return
-/// `Result<T, TerminalError>` and propagate with `?`.
+/// Fallible APIs return `Result<T, TerminalError>` and propagate with `?`.
 #[derive(Debug)]
 pub enum TerminalError {
-    /// PTY open / spawn / write / resize failure (`PtyPort`
-    /// implementations).
+    /// PTY open, spawn, write, or resize failure.
     Pty(String),
     /// Bounded-channel plumbing failure (receiver gone, closed early).
     #[allow(dead_code)]

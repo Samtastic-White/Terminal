@@ -1,16 +1,15 @@
 //! Golden fixtures — six writer-level families against hand-maintained
-//! raw-byte inputs (`cargo test` fully headless; design § 7; conventions
-//! § Testing: raw byte fixtures, no ad-hoc ANSI built inside assertions).
+//! raw-byte inputs.
 //!
-//! The seventh family of the spec's acceptance criteria — line-cap
-//! eviction order — is a session-DOCUMENT policy and lives with
-//! `SessionDocument` (`src/application/session.rs`, task T5).
+//! The seventh acceptance family, line-cap eviction order, is a
+//! session-document policy and lives with `SessionDocument` in
+//! `src/application/session.rs`.
 
 use super::BlockTextWriter;
 use crate::domain::output::{Color, Row};
 
-/// Feed raw chunks through a fresh writer, finalize (EOF flush), and
-/// collect the committed rows.
+/// Feeds raw chunks through a fresh writer, finalizes (EOF flush), and
+/// collects the committed rows.
 fn feed(cols: u16, chunks: &[&[u8]]) -> Vec<Row> {
     let mut writer = BlockTextWriter::new(cols);
     for chunk in chunks {
@@ -39,8 +38,8 @@ fn attrs_of(row: &Row, span: usize) -> (bool, bool, bool) {
     (style.bold, style.italic, style.underline)
 }
 
-/// Family 1 — Unicode widths: CJK/emoji occupy two columns and drive wrap
-/// points exactly like Latin text does.
+/// Unicode widths: CJK and emoji occupy two columns and drive wrap points
+/// exactly like Latin text.
 #[test]
 fn family_widths_cjk_emoji() {
     // '你' (2 cols): "ab你c" fills exactly 5 columns of a 5-col writer; X
@@ -52,13 +51,13 @@ fn family_widths_cjk_emoji() {
     let rows = feed(3, &[b"\xE4\xBD\xA0\xE5\xA5\xBD"]);
     assert_eq!(texts(&rows), ["你", "好"]);
 
-    // Emoji are double-width too (and stay single spans in text stream).
+    // Emoji are double-width too.
     let rows = feed(4, &[b"\xF0\x9F\x98\x80\xE5\xA5\xBD"]);
     assert_eq!(texts(&rows), ["😀好"]);
 }
 
-/// Family 2 — SGR palette: 16-color, bright, 256-indexed, 24-bit RGB,
-/// attribute set/reset — styles exactly as emitted, reset by SGR 0.
+/// SGR palette: 16-color, bright, 256-indexed, 24-bit RGB, and attribute
+/// set/reset. Styles apply exactly as emitted and reset with SGR 0.
 #[test]
 fn family_sgr_palette() {
     let rows = feed(80, &[b"\x1b[31mred\x1b[1mbold\x1b[0mend"]);
@@ -78,9 +77,8 @@ fn family_sgr_palette() {
     assert_eq!(attrs_of(&rows[0], 1), (false, false, true));
 }
 
-/// Family 3 — wrap at the last column: deferred auto-wrap (VT100
-/// pending-wrap), no fabricated empty rows from repeated last-column
-/// writes.
+/// Wrap at the last column: deferred auto-wrap (VT100 pending-wrap), no
+/// fabricated empty rows from repeated last-column writes.
 #[test]
 fn family_wrap_last_column() {
     let rows = feed(3, &[b"abcde"]);
@@ -92,8 +90,8 @@ fn family_wrap_last_column() {
     assert_eq!(texts(&rows), ["abX", "Y"]);
 }
 
-/// Family 4 — `\r` + `\x1b[K` rewrites: progress bars update in place,
-/// `EL` paints with the active background at erase time.
+/// `\r` + `\x1b[K` rewrites: progress bars update in place; `EL` paints with
+/// the active background at erase time.
 #[test]
 fn family_rewrite_progress_bar() {
     // Mid-flight chunked feed: each rewrote step is observable.
@@ -112,12 +110,11 @@ fn family_rewrite_progress_bar() {
     writer.write(b"\rdone\x1b[42m\x08\x1b[K\n");
     let rows = writer.take_committed_rows();
     assert_eq!(texts(&rows), ["don "]);
-    // blank painted with the active background (green).
     assert_eq!(bg_of(&rows[0], 1), Color::Indexed(2));
 }
 
-/// Family 5 — `EL`/`ED`: modes 0/1/2 over the current logical row; ED 3
-/// (scrollback clear) ignored.
+/// `EL`/`ED`: modes 0/1/2 over the current logical row; ED 3 (scrollback
+/// clear) ignored.
 #[test]
 fn family_el_ed_matrix() {
     // EL 0: erase from cursor to end.
@@ -136,8 +133,8 @@ fn family_el_ed_matrix() {
     assert_eq!(texts(&rows), ["abcd"]);
 }
 
-/// Family 6 — UTF-8 multi-byte sequences split across chunk reads
-/// reassemble correctly (mid-character cuts included).
+/// UTF-8 multibyte sequences split across chunk reads reassemble correctly,
+/// mid-character cuts included.
 #[test]
 fn family_utf8_split_across_chunks() {
     // 'é' = C3 A9 ; '😀' = F0 9F 98 80 — cut mid-character.

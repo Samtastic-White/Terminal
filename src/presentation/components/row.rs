@@ -5,8 +5,8 @@ use gpui::*;
 use crate::domain::output::Row;
 use crate::presentation::theme::TerminalTheme;
 
-/// Render one committed row as a horizontal run of styled spans. Rows are
-/// already wrapped by the writer, so no re-flow is applied here (BR-7).
+/// Renders one committed row as a run of styled spans. Rows are already
+/// wrapped by the writer, so no re-flow is applied here.
 fn render_row(row: &Row, theme: &TerminalTheme) -> impl IntoElement {
     let mut line = div()
         .flex()
@@ -46,7 +46,7 @@ fn render_row(row: &Row, theme: &TerminalTheme) -> impl IntoElement {
     line
 }
 
-/// Render the bounded session document. The window sets the font metrics
+/// Renders the bounded session document. The window sets the font metrics
 /// once for the whole block; spans only override colors and attributes.
 pub fn render_rows(
     rows: &std::collections::VecDeque<Row>,

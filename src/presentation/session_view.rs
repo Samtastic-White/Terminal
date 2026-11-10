@@ -1,10 +1,8 @@
-//! Session view — Phase 1 render surface, key capture, and resize hook
-//! (`knowledge/specs/pty-raw-output/design.md` § 1, § 5, § 6).
+//! Session view — render surface, key capture, and resize hook.
 //!
-//! The window bootstrap and the infrastructure adapters live in the
-//! composition root (`src/main.rs`); this view only depends on the
-//! Application service and Domain types. Presentation never holds a PTY
-//! handle (architecture Common Mistake #3).
+//! The window bootstrap and infrastructure adapters live in the composition
+//! root (`src/main.rs`); this view depends only on the application service and
+//! domain types. Presentation never holds a PTY handle.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
@@ -12,32 +10,29 @@ use std::time::Duration;
 use gpui::*;
 
 use crate::application::session::SessionService;
-use crate::domain::pty::PtySize;
+use crate::domain::size::TerminalSize;
 use crate::presentation::components::row::render_rows;
 use crate::presentation::theme::TerminalTheme;
 
-/// Drain-task idle wake (`design.md` § 4: POLL_INTERVAL).
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
-/// Maximum chunks parsed per wake; remaining chunks wait for the next
-/// timer tick so output ingestion never monopolizes a frame.
+/// Maximum chunks parsed per wake; remaining chunks wait for the next timer
+/// tick so output ingestion never monopolizes a frame.
 const MAX_CHUNKS_PER_WAKE: usize = 8;
 
-/// Horizontal padding of the output area (`px_3` on each side).
 const OUTPUT_PADDING_X: f32 = 24.0;
-/// Vertical padding of the output area (`py_2` on each side).
 const OUTPUT_PADDING_Y: f32 = 16.0;
 
-/// Main terminal window state: one Phase 1 session rendered as styled rows.
+/// One session rendered as styled rows.
 pub struct TerminalWindow {
     focus_handle: FocusHandle,
     session_service: SessionService,
     pty_receiver: Receiver<Vec<u8>>,
     theme: TerminalTheme,
     scroll: ScrollHandle,
-    last_pty_size: Option<PtySize>,
-    /// BR-10: auto-follow is active until the user scrolls back up.
+    last_terminal_size: Option<TerminalSize>,
+    /// Auto-follow is active until the user scrolls back up.
     follow_tail: bool,
-    /// The reader channel closed and the final row was flushed (BR-9).
+    /// The reader channel closed and the final row was flushed.
     stream_closed: bool,
     did_focus: bool,
     /// Foreground drain task; dropping it would stop output ingestion.
@@ -45,7 +40,7 @@ pub struct TerminalWindow {
 }
 
 impl TerminalWindow {
-    /// Build the session view around an already spawned session service.
+    /// Builds the session view around an already spawned session service.
     pub fn new(
         session_service: SessionService,
         pty_receiver: Receiver<Vec<u8>>,
@@ -53,10 +48,9 @@ impl TerminalWindow {
     ) -> Self {
         let theme = TerminalTheme::default();
 
-        // Drain task (`design.md` § 2/§ 3): bounded channel consumer that
-        // never runs on the render thread. `try_recv` drains what is
-        // available, then parks on the timer; every batch notifies the
-        // entity so the next frame renders the new rows.
+        // Bounded channel consumer that never runs on the render thread.
+        // `try_recv` drains what is available, then parks on the timer; every
+        // batch notifies the entity so the next frame renders the new rows.
         let _drain_task = cx.spawn(async move |this, cx| {
             loop {
                 let closed = this.update(cx, |this, cx| {
@@ -81,7 +75,7 @@ impl TerminalWindow {
             pty_receiver,
             theme,
             scroll: ScrollHandle::new(),
-            last_pty_size: None,
+            last_terminal_size: None,
             follow_tail: true,
             stream_closed: false,
             did_focus: false,
@@ -89,9 +83,9 @@ impl TerminalWindow {
         }
     }
 
-    /// Consume every chunk currently buffered. Returns `(changed, closed)`:
-    /// `changed` means the document grew; `closed` means the reader
-    /// channel disconnected and the final partial row was flushed.
+    /// Consumes every chunk currently buffered. Returns `(changed, closed)`:
+    /// `changed` means the document grew; `closed` means the reader channel
+    /// disconnected and the final partial row was flushed.
     fn drain_output(&mut self) -> (bool, bool) {
         let mut changed = false;
         let mut drained = 0;
@@ -116,9 +110,8 @@ impl TerminalWindow {
         (changed, false)
     }
 
-    /// Phase 1 keyboard passthrough (`design.md` § 5): the shell keeps its
-    /// own prompt and line editing, so keys go to the PTY as bytes — no
-    /// local input buffer and no ghost prompt.
+    /// Keyboard passthrough: the shell keeps its own prompt and line editing,
+    /// so keys go to the PTY as bytes. No local input buffer, no ghost prompt.
     fn handle_key(&mut self, event: &KeyDownEvent) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
@@ -141,8 +134,8 @@ impl TerminalWindow {
             "right" => self.write_keys(b"\x1b[C"),
             "left" => self.write_keys(b"\x1b[D"),
             _ => {
-                // Plain printable text. Modified keys outside the Phase 1
-                // table are dropped silently (never wrongly encoded).
+                // Modified keys outside the passthrough table are dropped
+                // silently rather than encoded wrongly.
                 if modifiers.alt || modifiers.platform || modifiers.function {
                     return;
                 }
@@ -156,14 +149,14 @@ impl TerminalWindow {
         }
     }
 
-    /// Route bytes through the Application layer (never the PTY directly).
+    /// Routes bytes through the application layer, never the PTY directly.
     fn write_keys(&mut self, bytes: &[u8]) {
         let _ = self.session_service.write_keystrokes(bytes);
     }
 
-    /// BR-7/T9: recompute cols/rows from font metrics and forward only when
-    /// the size actually changed (no debounce, but no per-frame ioctl
-    /// either). Stored rows keep their creation-time wrapping.
+    /// Recomputes cols/rows from font metrics and forwards only when the size
+    /// actually changed. No debounce, but no per-frame ioctl either; stored
+    /// rows keep their creation-time wrapping.
     fn update_pty_size(&mut self, window: &Window) {
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&gpui::font(self.theme.font_family));
@@ -183,10 +176,10 @@ impl TerminalWindow {
         let rows = (available_height / line_height)
             .floor()
             .clamp(1.0, u16::MAX as f32) as u16;
-        let size = PtySize::new(cols, rows);
+        let size = TerminalSize::new(cols, rows);
 
-        if self.last_pty_size != Some(size) {
-            self.last_pty_size = Some(size);
+        if self.last_terminal_size != Some(size) {
+            self.last_terminal_size = Some(size);
             let _ = self.session_service.resize(size);
         }
     }
@@ -211,8 +204,8 @@ impl Render for TerminalWindow {
 
         self.update_pty_size(window);
 
-        // BR-10: follow the tail while docked; a manual scroll suspends it
-        // and returning to the end resumes it.
+        // Follow the tail while docked; a manual scroll suspends it and
+        // returning to the end resumes it.
         if self.follow_tail {
             self.scroll.scroll_to_bottom();
         } else if self.is_at_bottom() {

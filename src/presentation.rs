@@ -1,8 +1,7 @@
 //! Presentation layer: GPUI views, components, and rendering.
 //!
-//! Driving Adapter — translates GPUI events into Application layer calls.
-//! Never contains terminal state logic or PTY operations.
-//! (`knowledge/architecture.md` § Layer Responsibilities)
+//! Driving adapter: translates GPUI events into application calls. It never
+//! holds terminal state or touches the PTY.
 
 pub mod components;
 pub mod session_view;
