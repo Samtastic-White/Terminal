@@ -1,5 +1,3 @@
-//! Design tokens, colors, paddings, font configurations.
-
 use gpui::*;
 
 /// Catppuccin Mocha palette. The full token set stays available even when
@@ -74,10 +72,16 @@ pub mod colors {
 pub struct TerminalTheme {
     pub background: Rgba,
     pub foreground: Rgba,
-    #[allow(dead_code)]
-    pub cursor: Rgba,
-    #[allow(dead_code)]
-    pub selection: Rgba,
+    pub card_background: Rgba,
+    pub card_border: Rgba,
+    pub card_header: Rgba,
+    pub card_meta: Rgba,
+    pub badge_running: Rgba,
+    pub badge_success: Rgba,
+    pub badge_failure: Rgba,
+    pub badge_interrupted: Rgba,
+    pub badge_text: Rgba,
+    pub selection_background: Rgba,
     pub font_size: f32,
     pub line_height: f32,
     pub font_family: &'static str,
@@ -88,8 +92,16 @@ impl Default for TerminalTheme {
         Self {
             background: colors::BASE,
             foreground: colors::TEXT,
-            cursor: colors::ROSEWATER,
-            selection: colors::SURFACE1,
+            card_background: colors::MANTLE,
+            card_border: colors::SURFACE1,
+            card_header: colors::TEXT,
+            card_meta: colors::OVERLAY1,
+            badge_running: colors::SURFACE2,
+            badge_success: colors::GREEN,
+            badge_failure: colors::RED,
+            badge_interrupted: colors::OVERLAY1,
+            badge_text: colors::CRUST,
+            selection_background: colors::SURFACE2,
             font_size: 14.0,
             line_height: 1.5,
             font_family: "JetBrains Mono",

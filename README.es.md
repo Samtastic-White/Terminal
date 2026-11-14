@@ -81,7 +81,8 @@ Para que el motor sepa cuándo empieza un comando, cuándo termina y qué códig
 | `\e]133;B\e\` | Fin de prompt: el usuario empieza a escribir |
 | `\e]133;C\e\` | Comando ejecutado: arranca el proceso, se instancia el bloque activo |
 | `\e]133;D;<code>\e\` | Comando finalizado: captura del código de salida y duración |
-| `\e]133;P;Cwd=<ruta>\e\` | Sincronización de directorio para el panel lateral |
+| `\e]633;P;Cwd=<ruta>\e\` | Sincronización de directorio para el panel lateral |
+| `\e]633;E;<comando>\e\` | Línea de comando exacta ejecutada para el encabezado del bloque |
 
 ---
 

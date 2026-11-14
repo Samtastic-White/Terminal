@@ -3,7 +3,11 @@ pub enum Color {
     #[default]
     Default,
     Indexed(u8),
-    Rgb { r: u8, g: u8, b: u8 },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -16,7 +20,7 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_plain(&self) -> bool {
         self.fg == Color::Default
             && self.bg == Color::Default
@@ -33,7 +37,7 @@ pub struct Span {
 }
 
 impl Span {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(style: TextStyle, text: impl Into<String>) -> Self {
         Self {
             style,
@@ -45,11 +49,4 @@ impl Span {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row {
     pub spans: Vec<Span>,
-}
-
-impl Row {
-    #[allow(dead_code)]
-    pub fn is_blank(&self) -> bool {
-        self.spans.iter().all(|span| span.text.is_empty())
-    }
 }

@@ -1,3 +1,2 @@
-//! Cross-cutting shared primitives.
-
 pub mod errors;
+pub mod logging;
