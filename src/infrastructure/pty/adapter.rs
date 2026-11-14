@@ -1,25 +1,22 @@
-//! `PtyAdapter` implements the domain `PtyPort` with `portable-pty`.
-//!
-//! Reads run on a dedicated OS thread. Chunks travel through a bounded
-//! `SyncSender` whose `send` blocks when full: the reader parks and the kernel
-//! pipe buffer throttles the child. PTY bytes are never dropped. EOF marks the
-//! session ended and reaps the child, leaving no zombie.
+//! Adapter body: child command construction, spawn with reader thread, port
+//! implementation, and teardown.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtyPair, native_pty_system};
+use tracing::{debug, info, warn};
 
+use super::{CHANNEL_CAP, PTY_BUFFER_BYTES, ZSH_PATH};
 use crate::common::errors::{Result, TerminalError};
 use crate::domain::pty::PtyPort;
 use crate::domain::size::TerminalSize;
 
-const PTY_BUFFER_BYTES: usize = 8 * 1024;
-/// Bounded channel capacity in chunks (about 512 KiB in flight).
-const CHANNEL_CAP: usize = 64;
-const ZSH_PATH: &str = "/bin/zsh";
+use super::shell_integration::ShellIntegration;
 
 fn pty_err<E: std::fmt::Display>(error: E) -> TerminalError {
     TerminalError::Pty(error.to_string())
@@ -32,11 +29,14 @@ pub struct PtyAdapter {
     writer: Option<Box<dyn Write + Send>>,
     /// Shared with the reader thread: it must reap the child after EOF.
     child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     /// False once the reader finished (EOF or channel closed).
     reader_alive: Arc<AtomicBool>,
     spawned: bool,
     /// Handed to the composition root (channel consumer) after spawn.
     pending_receiver: Option<Receiver<Vec<u8>>>,
+    /// Wrapper dotfiles injected for the current spawn; removed on drop.
+    pub(super) integration: Option<ShellIntegration>,
 }
 
 impl Default for PtyAdapter {
@@ -60,9 +60,11 @@ impl PtyAdapter {
             master: None,
             writer: None,
             child: Arc::new(Mutex::new(None)),
+            killer: None,
             reader_alive: Arc::new(AtomicBool::new(true)),
             spawned: false,
             pending_receiver: None,
+            integration: None,
         }
     }
 
@@ -71,15 +73,35 @@ impl PtyAdapter {
         self.pending_receiver.take()
     }
 
-    fn build_command(&self) -> CommandBuilder {
+    pub(super) fn build_command(&mut self) -> Result<CommandBuilder> {
         let mut command = CommandBuilder::new(self.shell_path);
         // Interactive login shell: zsh reads its own startup files.
         command.arg("-il");
-        command.env("NATIVE_TERMINAL", "1");
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command
+        apply_shell_env(&mut command);
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let user_zdotdir = std::env::var_os("ZDOTDIR")
+            .map(PathBuf::from)
+            .or(home)
+            .ok_or_else(|| TerminalError::Pty("HOME is not set".into()))?;
+        let integration = ShellIntegration::prepare(&user_zdotdir)?;
+        command.env("ZDOTDIR", integration.dir());
+        command.env("NT_USER_ZDOTDIR", integration.user_zdotdir());
+        debug!("shell integration prepared");
+        self.integration = Some(integration);
+
+        Ok(command)
     }
+}
+
+/// Child environment contract: the engine owns terminal identity and shell,
+/// and clears the nesting guard inherited from any parent session.
+pub(super) fn apply_shell_env(command: &mut CommandBuilder) {
+    command.env("NATIVE_TERMINAL", "1");
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("SHELL", ZSH_PATH);
+    command.env_remove("NATIVE_TERMINAL_ACTIVE");
 }
 
 impl PtyPort for PtyAdapter {
@@ -101,7 +123,9 @@ impl PtyPort for PtyAdapter {
             .map_err(pty_err)?;
         let PtyPair { master, slave } = pair;
 
-        let child = slave.spawn_command(self.build_command()).map_err(pty_err)?;
+        let command = self.build_command()?;
+        let child = slave.spawn_command(command).map_err(pty_err)?;
+        let killer = child.clone_killer();
         let reader = master.try_clone_reader().map_err(pty_err)?;
         let writer = master.take_writer().map_err(pty_err)?;
 
@@ -117,12 +141,22 @@ impl PtyPort for PtyAdapter {
             .spawn(move || {
                 let mut reader = reader;
                 let mut buffer = vec![0u8; PTY_BUFFER_BYTES];
+                debug!("pty reader started");
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => break, // EOF (child death / PTY closed)
                         Ok(n) => {
+                            let started = Instant::now();
                             if sender.send(buffer[..n].to_vec()).is_err() {
                                 break; // consumer gone; nothing to deliver
+                            }
+                            let waited = started.elapsed();
+                            if waited >= Duration::from_millis(1) {
+                                debug!(
+                                    wait_us = waited.as_micros() as u64,
+                                    capacity = CHANNEL_CAP,
+                                    "pty reader blocked on full channel"
+                                );
                             }
                         }
                         Err(error) => {
@@ -133,12 +167,12 @@ impl PtyPort for PtyAdapter {
                         }
                     }
                 }
+                info!("pty reader finished");
                 drop(sender);
                 reader_alive.store(false, Ordering::Relaxed);
-                // Reap the child: no zombie.
-                if let Ok(mut guard) = reaper.lock()
-                    && let Some(mut child) = guard.take()
-                {
+                // Reap outside the lock: `wait()` can block on the child.
+                let child = reaper.lock().ok().and_then(|mut guard| guard.take());
+                if let Some(mut child) = child {
                     let _ = child.wait();
                 }
             })
@@ -149,8 +183,15 @@ impl PtyPort for PtyAdapter {
         }
         self.master = Some(master);
         self.writer = Some(writer);
+        self.killer = Some(killer);
         self.pending_receiver = Some(receiver);
         self.spawned = true;
+        info!(
+            shell = self.shell_path,
+            cols = size.cols,
+            rows = size.rows,
+            "pty spawned"
+        );
         Ok(())
     }
 
@@ -162,8 +203,13 @@ impl PtyPort for PtyAdapter {
         let Some(writer) = self.writer.as_mut() else {
             return Err(TerminalError::Pty("session not spawned".into()));
         };
-        writer.write_all(bytes).map_err(pty_err)?;
-        writer.flush().map_err(pty_err)
+        writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|error| {
+                warn!(error = %error, "pty write failed");
+                pty_err(error)
+            })
     }
 
     /// Immediate resize; the kernel SIGWINCH reaches the foreground group.
@@ -179,7 +225,9 @@ impl PtyPort for PtyAdapter {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(pty_err)
+            .map_err(pty_err)?;
+        debug!(cols = size.cols, rows = size.rows, "pty resized");
+        Ok(())
     }
 
     fn is_alive(&self) -> bool {
@@ -189,111 +237,13 @@ impl PtyPort for PtyAdapter {
 
 impl Drop for PtyAdapter {
     fn drop(&mut self) {
-        // Kill the child so its pipe closes and the reader finalizes;
-        // the master drop closes our side of the PTY.
+        // Kill before closing the PTY: an interactive shell may survive the
+        // master close and keep the reader blocked in `wait`.
+        if let Some(mut killer) = self.killer.take() {
+            let _ = killer.kill();
+        }
         self.writer.take();
         self.master.take();
-        if let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take()) {
-            let _ = child.kill();
-        }
         self.reader_alive.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    fn drain_until_received(
-        receiver: &mut Receiver<Vec<u8>>,
-        needle: &[u8],
-        deadline: Duration,
-    ) -> Option<Vec<u8>> {
-        let start = std::time::Instant::now();
-        let mut acc: Vec<u8> = Vec::new();
-        while start.elapsed() < deadline {
-            let chunk = match receiver.recv_timeout(deadline.saturating_sub(start.elapsed())) {
-                Ok(bytes) => bytes,
-                Err(_) => return None,
-            };
-            acc.extend(chunk);
-            if acc.windows(needle.len()).any(|w| w == needle) {
-                return Some(acc);
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn bytes_round_trip_through_spawned_shell() {
-        let mut adapter = PtyAdapter::new();
-        adapter.spawn(TerminalSize::new(80, 24)).unwrap();
-        let mut receiver = adapter.take_output().unwrap();
-
-        // Drain the banner noise until the prompt settles.
-        drain_until_received(&mut receiver, b" ", Duration::from_secs(5));
-
-        adapter.write(b"echo NT_ROUNDTRIP_42\r").unwrap();
-        let acc = drain_until_received(&mut receiver, b"NT_ROUNDTRIP_42", Duration::from_secs(5))
-            .expect("round-trip output within deadline");
-        assert!(acc.windows(15).any(|w| w == b"NT_ROUNDTRIP_42"));
-    }
-
-    #[test]
-    fn full_channel_blocks_the_reader_no_bytes_dropped() {
-        // A full channel must park `send` until the consumer drains.
-        let (sender, receiver) = sync_channel::<Vec<u8>>(1);
-        sender.send(vec![1]).unwrap();
-
-        let parked_done = Arc::new(AtomicBool::new(false));
-        let done_flag = parked_done.clone();
-        let handle = std::thread::spawn(move || {
-            sender.send(vec![2]).unwrap(); // blocks: channel full
-            done_flag.store(true, Ordering::Relaxed);
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !parked_done.load(Ordering::Relaxed),
-            "send must park while full"
-        );
-
-        let drained = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(drained, vec![1]);
-        handle.join().unwrap();
-        // The parked chunk lands after the drain — no bytes dropped.
-        let parked = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(parked, vec![2]);
-        assert!(parked_done.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn eof_marks_session_ended() {
-        let mut adapter = PtyAdapter::new();
-        adapter.spawn(TerminalSize::new(80, 24)).unwrap();
-        let receiver = adapter.take_output().unwrap();
-
-        adapter.write(b"exit\r").unwrap();
-        let deadline = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        // Drain until the reader thread closes the channel.
-        while receiver
-            .recv_timeout(
-                deadline
-                    .saturating_sub(start.elapsed())
-                    .max(Duration::from_millis(1)),
-            )
-            .is_ok()
-        {}
-        assert!(!adapter.is_alive(), "EOF must finish the session");
-    }
-
-    #[test]
-    fn spawn_failure_maps_to_terminal_error() {
-        let mut adapter = PtyAdapter::with_shell("/nonexistent-shell-9f3ad1");
-        let error = adapter
-            .spawn(TerminalSize::new(80, 24))
-            .expect_err("missing shell must fail");
-        assert!(matches!(error, TerminalError::Pty(_)));
     }
 }

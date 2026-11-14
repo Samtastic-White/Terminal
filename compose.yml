@@ -4,20 +4,25 @@ services:
       context: .
       dockerfile: dev.Dockerfile
       args:
-        UID: 1000
-        GID: 1000
+        UID: ${DEV_UID:-1000}
+        GID: ${DEV_GID:-1000}
     container_name: terminal-gpui-dev
-    env_file:
-    - .env
+    init: true
     volumes:
       - .:/workspace:z
+      - cargo-cache:/home/developer/.cargo
+      - rustup-toolchain:/home/developer/.rustup
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
-      - ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-0}:${XDG_RUNTIME_DIR:-/run/user/1000}/${WAYLAND_DISPLAY:-wayland-0}
     environment:
-      - DISPLAY=${DISPLAY}
+      - DISPLAY=${DISPLAY:-}
       - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
-      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1000}
     devices:
       - /dev/dri:/dev/dri
     ipc: host
     network_mode: host
+
+volumes:
+  cargo-cache:
+  rustup-toolchain:

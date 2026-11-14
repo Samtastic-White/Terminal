@@ -1,3 +1,2 @@
-//! Presentation components barrel.
-
+pub mod block_card;
 pub mod row;

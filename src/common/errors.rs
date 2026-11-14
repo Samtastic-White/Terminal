@@ -12,7 +12,7 @@ pub enum TerminalError {
     /// PTY open, spawn, write, or resize failure.
     Pty(String),
     /// Bounded-channel plumbing failure (receiver gone, closed early).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved: current channel operations fail closed without it.
     Channel(String),
 }
 

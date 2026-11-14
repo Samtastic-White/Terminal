@@ -81,7 +81,8 @@ So the engine knows when a command starts, when it ends, and what code it produc
 | `\e]133;B\e\` | Prompt end: the user starts typing |
 | `\e]133;C\e\` | Command executed: process starts, active block is instantiated |
 | `\e]133;D;<code>\e\` | Command finished: exit code and duration captured |
-| `\e]133;P;Cwd=<path>\e\` | Directory sync for the sidebar panel |
+| `\e]633;P;Cwd=<path>\e\` | Directory sync for the sidebar panel |
+| `\e]633;E;<command>\e\` | Exact executed command line for the block header |
 
 ---
 

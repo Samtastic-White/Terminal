@@ -1,12 +1,10 @@
-//! Row rendering component — converts domain rows/spans into GPUI elements.
-
 use gpui::*;
 
 use crate::domain::output::Row;
 use crate::presentation::theme::TerminalTheme;
 
-/// Renders one committed row as a run of styled spans. Rows are already
-/// wrapped by the writer, so no re-flow is applied here.
+/// Renders one styled row. Rows are already wrapped by the writer, so no
+/// re-flow is applied here.
 fn render_row(row: &Row, theme: &TerminalTheme) -> impl IntoElement {
     let mut line = div()
         .flex()
@@ -46,10 +44,12 @@ fn render_row(row: &Row, theme: &TerminalTheme) -> impl IntoElement {
     line
 }
 
-/// Renders the bounded session document. The window sets the font metrics
-/// once for the whole block; spans only override colors and attributes.
-pub fn render_rows(
-    rows: &std::collections::VecDeque<Row>,
+/// Renders rows plus, when present, the row still being built. The window
+/// sets the font metrics once for the whole block; spans only override colors
+/// and attributes.
+pub fn render_rows<'a>(
+    rows: impl IntoIterator<Item = &'a Row>,
+    active: Option<&'a Row>,
     theme: &TerminalTheme,
 ) -> impl IntoElement {
     div()
@@ -59,5 +59,9 @@ pub fn render_rows(
         .font_family(theme.font_family)
         .text_size(px(theme.font_size))
         .line_height(px(theme.font_size * theme.line_height))
-        .children(rows.iter().map(|row| render_row(row, theme)))
+        .children(
+            rows.into_iter()
+                .chain(active)
+                .map(|row| render_row(row, theme)),
+        )
 }

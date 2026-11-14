@@ -1,9 +1,8 @@
 //! Golden fixtures — six writer-level families against hand-maintained
 //! raw-byte inputs.
 //!
-//! The seventh acceptance family, line-cap eviction order, is a
-//! session-document policy and lives with `SessionDocument` in
-//! `src/application/session.rs`.
+//! Line-cap eviction order is block/session policy and lives with
+//! `BlockService` in `src/application/block/service.rs`.
 
 use super::BlockTextWriter;
 use crate::domain::output::{Color, Row};
@@ -51,7 +50,6 @@ fn family_widths_cjk_emoji() {
     let rows = feed(3, &[b"\xE4\xBD\xA0\xE5\xA5\xBD"]);
     assert_eq!(texts(&rows), ["你", "好"]);
 
-    // Emoji are double-width too.
     let rows = feed(4, &[b"\xF0\x9F\x98\x80\xE5\xA5\xBD"]);
     assert_eq!(texts(&rows), ["😀好"]);
 }
@@ -94,7 +92,6 @@ fn family_wrap_last_column() {
 /// the active background at erase time.
 #[test]
 fn family_rewrite_progress_bar() {
-    // Mid-flight chunked feed: each rewrote step is observable.
     let mut writer = BlockTextWriter::new(12);
     writer.write(b"\x1b[1m50%\x1b[0m");
     assert_eq!(texts(&writer.take_committed_rows()), Vec::<String>::new());
