@@ -35,6 +35,8 @@ pub struct PtyAdapter {
     spawned: bool,
     /// Handed to the composition root (channel consumer) after spawn.
     pending_receiver: Option<Receiver<Vec<u8>>>,
+    /// Coalesced wake signal for the consumer; one token while unread.
+    pending_waker: Option<Receiver<()>>,
     /// Wrapper dotfiles injected for the current spawn; removed on drop.
     pub(super) integration: Option<ShellIntegration>,
 }
@@ -64,6 +66,7 @@ impl PtyAdapter {
             reader_alive: Arc::new(AtomicBool::new(true)),
             spawned: false,
             pending_receiver: None,
+            pending_waker: None,
             integration: None,
         }
     }
@@ -71,6 +74,11 @@ impl PtyAdapter {
     /// Take the output channel receiver (one handoff; None afterwards).
     pub fn take_output(&mut self) -> Option<Receiver<Vec<u8>>> {
         self.pending_receiver.take()
+    }
+
+    /// Take the coalesced wake receiver (one handoff; None afterwards).
+    pub fn take_waker(&mut self) -> Option<Receiver<()>> {
+        self.pending_waker.take()
     }
 
     pub(super) fn build_command(&mut self) -> Result<CommandBuilder> {
@@ -133,6 +141,8 @@ impl PtyPort for PtyAdapter {
         // `send` blocks on a full bounded channel, so the kernel pipe
         // throttles the child.
         let (sender, receiver) = sync_channel::<Vec<u8>>(CHANNEL_CAP);
+        // Capacity one: repeated try_send calls coalesce into a single wake.
+        let (wake_sender, wake_receiver) = sync_channel::<()>(1);
         let reaper = self.child.clone();
         let reader_alive = self.reader_alive.clone();
 
@@ -150,6 +160,8 @@ impl PtyPort for PtyAdapter {
                             if sender.send(buffer[..n].to_vec()).is_err() {
                                 break; // consumer gone; nothing to deliver
                             }
+                            // A full wake channel already has one pending.
+                            let _ = wake_sender.try_send(());
                             let waited = started.elapsed();
                             if waited >= Duration::from_millis(1) {
                                 debug!(
@@ -185,6 +197,7 @@ impl PtyPort for PtyAdapter {
         self.writer = Some(writer);
         self.killer = Some(killer);
         self.pending_receiver = Some(receiver);
+        self.pending_waker = Some(wake_receiver);
         self.spawned = true;
         info!(
             shell = self.shell_path,

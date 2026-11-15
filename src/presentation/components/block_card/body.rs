@@ -27,11 +27,19 @@ impl BodyRun {
 ///
 /// `row_starts[i]` is the byte offset where row `i` begins. A trailing blank
 /// row needs an extra `\n` so `TextLayout`'s newline-based indexing keeps it.
+///
+/// The body grows incrementally: [`BodyText::push_row`] appends without
+/// touching the stored prefix, and [`BodyText::drop_front`] only advances a
+/// base offset. Evicted bytes are reclaimed by an amortized compaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BodyText {
     text: String,
     runs: Vec<BodyRun>,
     row_starts: Vec<usize>,
+    /// Index into `row_starts` of the first live row.
+    first_row: usize,
+    /// Byte offset of the first live row inside `text`.
+    base_byte: usize,
 }
 
 /// A contiguous row window sliced out of a [`BodyText`].
@@ -76,7 +84,56 @@ impl BodyText {
     }
 
     pub fn row_count(&self) -> usize {
-        self.row_starts.len()
+        self.row_starts.len() - self.first_row
+    }
+
+    /// Appends one row. Equivalent to one step of [`build_body_text`].
+    pub fn push_row(&mut self, row: &Row) {
+        if self.row_count() > 0 {
+            push_newline(&mut self.text, &mut self.runs);
+        }
+        self.row_starts.push(self.text.len());
+        for span in &row.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let start = self.text.len();
+            self.text.push_str(&span.text);
+            merge_run(&mut self.runs, start..self.text.len(), span.style);
+        }
+    }
+
+    /// Drops the oldest `count` rows without copying the live tail; dead bytes
+    /// are reclaimed once they dominate the buffer.
+    pub fn drop_front(&mut self, count: usize) {
+        let count = count.min(self.row_count());
+        if count == 0 {
+            return;
+        }
+        self.first_row += count;
+        self.base_byte = self.row_starts[self.first_row];
+        if self.base_byte >= 64 * 1024 && self.base_byte * 2 >= self.text.len() {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        let base = self.base_byte;
+        self.text.drain(..base);
+        self.runs.retain_mut(|run| {
+            if run.range.end <= base {
+                return false;
+            }
+            run.range.start = run.range.start.saturating_sub(base);
+            run.range.end -= base;
+            true
+        });
+        self.row_starts.drain(..self.first_row);
+        for start in &mut self.row_starts {
+            *start -= base;
+        }
+        self.first_row = 0;
+        self.base_byte = 0;
     }
 
     /// Slices rows `start_row..end_row`, applying `selection` (absolute byte
@@ -87,32 +144,36 @@ impl BodyText {
         end_row: usize,
         selection: Option<Range<usize>>,
     ) -> BodySlice {
-        let start_row = start_row.min(self.row_count());
-        let end_row = end_row.min(self.row_count()).max(start_row);
+        let row_count = self.row_count();
+        let start_row = start_row.min(row_count);
+        let end_row = end_row.min(row_count).max(start_row);
+        let body_len = self.text.len() - self.base_byte;
         if start_row >= end_row {
             return BodySlice {
                 text: String::new(),
                 runs: Vec::new(),
-                start_byte: self.text.len(),
+                start_byte: body_len,
             };
         }
 
-        let start_byte = self.row_starts[start_row];
-        let end_byte = if end_row == self.row_count() {
-            self.text.len()
+        let start_byte = self.row_starts[self.first_row + start_row] - self.base_byte;
+        let end_byte = if end_row == row_count {
+            body_len
         } else {
             // `row_starts[end_row]` sits after the separator before that row.
-            self.row_starts[end_row] - 1
+            self.row_starts[self.first_row + end_row] - self.base_byte - 1
         };
-        let selection = selection.map(|range| clamp_selection(range, &self.text));
+        let selection = selection.map(|range| clamp_selection(range, &self.text[self.base_byte..]));
 
         let mut runs = Vec::new();
         for run in &self.runs {
-            let lo = run.range.start.max(start_byte);
-            let hi = run.range.end.min(end_byte);
+            let lo = run.range.start.max(start_byte + self.base_byte);
+            let hi = run.range.end.min(end_byte + self.base_byte);
             if lo >= hi {
                 continue;
             }
+            let lo = lo - self.base_byte;
+            let hi = hi - self.base_byte;
             match &selection {
                 Some(selected) if selected.start < hi && selected.end > lo => {
                     let sel_lo = lo.max(selected.start);
@@ -126,7 +187,7 @@ impl BodyText {
         }
 
         BodySlice {
-            text: self.text[start_byte..end_byte].to_owned(),
+            text: self.text[self.base_byte + start_byte..self.base_byte + end_byte].to_owned(),
             runs,
             start_byte,
         }
@@ -161,41 +222,11 @@ impl BodySlice {
 
 /// Flattens rows into newline-separated text with one run per styled segment.
 pub fn build_body_text<'a>(rows: impl IntoIterator<Item = &'a Row>) -> BodyText {
-    let mut text = String::new();
-    let mut runs = Vec::new();
-    let mut row_starts = Vec::new();
-    let mut last_row_empty = true;
-    let mut rows_seen = 0usize;
-
+    let mut body = BodyText::default();
     for row in rows {
-        if rows_seen > 0 {
-            push_newline(&mut text, &mut runs);
-        }
-        row_starts.push(text.len());
-        last_row_empty = true;
-        for span in &row.spans {
-            if span.text.is_empty() {
-                continue;
-            }
-            last_row_empty = false;
-            let start = text.len();
-            text.push_str(&span.text);
-            merge_run(&mut runs, start..text.len(), span.style);
-        }
-        rows_seen += 1;
+        body.push_row(row);
     }
-
-    // `split('\n')` drops a trailing empty segment unless the text ends with a
-    // newline; keep the final blank row addressable.
-    if rows_seen > 1 && last_row_empty && !text.ends_with('\n') {
-        push_newline(&mut text, &mut runs);
-    }
-
-    BodyText {
-        text,
-        runs,
-        row_starts,
-    }
+    body
 }
 
 /// Clamps a byte range to character boundaries so slicing never panics on

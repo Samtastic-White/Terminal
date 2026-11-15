@@ -119,6 +119,11 @@ impl Block {
         self.output_revision
     }
 
+    /// Total rows ever pushed, including rows already evicted by the cap.
+    pub fn output_total(&self) -> u64 {
+        self.output.pushed()
+    }
+
     /// Appends an output row, returning true when the block evicted its oldest.
     pub fn push_row(&mut self, row: Row) -> bool {
         let evicted = self.output.push(row);

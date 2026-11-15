@@ -9,7 +9,7 @@ use gpui::*;
 
 use super::actions::{CARD_ACTIONS, render_action};
 use super::body::BodySlice;
-use super::snapshot::{CardSnapshot, StatusTone, card_snapshot_with_relative};
+use super::snapshot::{CardSnapshot, StatusTone};
 use super::state::{BlockUiState, BodyLayout, PendingBody};
 use crate::domain::block::{Block, BlockId, CopyKind};
 use crate::presentation::theme::TerminalTheme;
@@ -257,8 +257,7 @@ pub fn render_block_card(
     let (snapshot, body_height) = {
         let mut state = ui.borrow_mut();
         state.sync_body(block);
-        let relative = state.relative_label(block, now);
-        let snapshot = card_snapshot_with_relative(block, relative);
+        let snapshot = state.header_snapshot(block, now);
         let body_height = if snapshot.has_body {
             state.prepare_body(theme)
         } else {

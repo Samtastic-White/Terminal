@@ -3,19 +3,27 @@
 
 use std::io::{BufRead as _, BufReader};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROBE_SETTLE: Duration = Duration::from_secs(15);
 const PROBE_SAMPLES: usize = 10;
 const PROBE_STEP: Duration = Duration::from_secs(2);
 
-const IDLE_PSS_LIMIT_KB: u64 = 30_000;
+/// Absolute PSS ceiling from the roadmap; the ~70 MB platform floor (GPU
+/// driver stack + gpui engine) is the reference point, not a budget.
+const IDLE_PSS_CEILING_KB: u64 = 80_000;
+const IDLE_PSS_FLOOR_KB: u64 = 70_000;
 /// Vsync period of a 144 Hz monitor, in microseconds (informational target).
 const PACING_TARGET_US: u64 = 6_944;
+/// Fewer idle gaps than this cannot describe a cadence.
+const MIN_PACING_SAMPLES: usize = 10;
 
 static TOTAL_FRAMES: AtomicU64 = AtomicU64::new(0);
 static FRAME_GAPS_US: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static LAST_FRAME: Mutex<Option<Instant>> = Mutex::new(None);
+static PROBE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn measure_enabled() -> bool {
     measure_enabled_from(std::env::var("NT_MEASURE").ok().as_deref())
@@ -23,6 +31,23 @@ pub(crate) fn measure_enabled() -> bool {
 
 pub(crate) fn measure_enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
+}
+
+/// Called once per rendered frame. No-op unless the probe is active.
+pub(crate) fn record_frame() {
+    if !*PROBE_ENABLED.get_or_init(measure_enabled) {
+        return;
+    }
+    TOTAL_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let now = Instant::now();
+    let mut last = LAST_FRAME.lock().unwrap();
+    if let Some(previous) = *last {
+        FRAME_GAPS_US
+            .lock()
+            .unwrap()
+            .push(now.duration_since(previous).as_micros() as u64);
+    }
+    *last = Some(now);
 }
 
 pub(crate) fn backend_name() -> &'static str {
@@ -111,6 +136,10 @@ pub(crate) fn run_probe(backend: &'static str) {
     let p50 = percentile(&sorted, 0.50);
     let p99 = percentile(&sorted, 0.99);
     let max = sorted.last().copied().unwrap_or(0);
+    let frames = TOTAL_FRAMES.load(Ordering::Relaxed);
+    // An idle window that renders almost nothing yields no cadence to judge;
+    // reporting PASS there would be vacuous.
+    let paced = frames > 0 && sorted.len() >= MIN_PACING_SAMPLES && p50 > 0;
     // Pacing is judged against the OBSERVED vsync period (p50), not the
     // advertised refresh: a steady cadence is healthy pacing; the observed
     // Hz itself surfaces a 144 Hz panel being throttled to 60.
@@ -133,27 +162,26 @@ pub(crate) fn run_probe(backend: &'static str) {
     println!("\n=== NT_IDLE_PROBE — backend: {} ===", backend);
     println!(
         "frames: {} | gaps us P50 {} / P99 {} / max {} | ~{:.1} Hz observed | dropped-frame events: {}",
-        TOTAL_FRAMES.load(Ordering::Relaxed),
-        p50,
-        p99,
-        max,
-        hz,
-        dropped
+        frames, p50, p99, max, hz, dropped
     );
     println!(
-        "VERDICT idle PSS: {} (p50 last 5 samples = {} kB, limit {} kB) | VERDICT pacing: {} (P99 {} us vs observed tolerance {} us; expected {} us @ 144 Hz; dropped = {})",
-        if idle_pss < IDLE_PSS_LIMIT_KB {
+        "VERDICT idle PSS: {} (p50 last 5 samples = {} kB, ceiling {} kB, reference floor {} kB) | VERDICT pacing: {} (gaps = {}, P99 {} us vs observed tolerance {} us; expected {} us @ 144 Hz; dropped = {})",
+        if idle_pss < IDLE_PSS_CEILING_KB {
             "PASS"
         } else {
             "FAIL"
         },
         idle_pss,
-        IDLE_PSS_LIMIT_KB,
-        if p99 <= p99_tolerance && dropped == 0 {
+        IDLE_PSS_CEILING_KB,
+        IDLE_PSS_FLOOR_KB,
+        if !paced {
+            "NO DATA"
+        } else if p99 <= p99_tolerance && dropped == 0 {
             "PASS"
         } else {
             "FAIL"
         },
+        sorted.len(),
         p99,
         p99_tolerance,
         PACING_TARGET_US,

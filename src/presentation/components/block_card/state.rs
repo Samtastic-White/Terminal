@@ -3,14 +3,16 @@
 //! caller because GPUI listeners need shared mutable access.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::*;
 
 use super::body::{BodyText, build_body_text};
+use super::snapshot::{CardSnapshot, card_snapshot_with_relative};
 use super::view::body_text_runs;
 use crate::application::block::format_relative;
-use crate::domain::block::Block;
+use crate::domain::block::{Block, BlockStatus};
 use crate::presentation::theme::TerminalTheme;
 
 /// Maximum visual lines a card body shows before scrolling locally.
@@ -47,7 +49,18 @@ struct BodyKey {
 
 struct CachedBody {
     revision: u64,
+    total: u64,
     body: BodyText,
+}
+
+/// Header snapshot cached until its inputs change: output revision, status,
+/// command, or the wall-clock second the relative age is expressed in.
+struct CachedHeader {
+    revision: u64,
+    status: BlockStatus,
+    second: u64,
+    command: String,
+    snapshot: Rc<CardSnapshot>,
 }
 
 /// Slice waiting to be shaped on the next prepaint, so shaping happens with
@@ -80,7 +93,7 @@ pub struct BlockUiState {
     pub(super) pending: Option<PendingBody>,
     pub(super) layout: Option<BodyLayout>,
     layout_key: Option<BodyKey>,
-    relative: Option<(u64, String)>,
+    header: Option<CachedHeader>,
 }
 
 impl Default for BlockUiState {
@@ -101,24 +114,50 @@ impl BlockUiState {
             pending: None,
             layout: None,
             layout_key: None,
-            relative: None,
+            header: None,
         }
     }
 
-    /// Rebuilds the cached flat body only when the output changed. Appending
-    /// output invalidates byte offsets, so any selection is dropped.
+    /// Syncs the cached flat body with the block. Appends only the rows added
+    /// since the last revision and drops evicted rows from the front, falling
+    /// back to a full rebuild when the counters disagree. Appending output
+    /// invalidates byte offsets, so any selection is dropped.
     pub(super) fn sync_body(&mut self, block: &Block) {
         let revision = block.output_revision();
+        let total = block.output_total();
         if self
             .body
             .as_ref()
-            .is_some_and(|cached| cached.revision == revision)
+            .is_some_and(|cached| cached.revision == revision && cached.total == total)
         {
             return;
         }
+
+        let rows = block.output();
+        let row_count = rows.len();
+        let previous = self.body.take();
+        let body = match previous {
+            Some(cached) if total > cached.total && revision > cached.revision => {
+                let appended = (total - cached.total) as usize;
+                let cached_rows = cached.body.row_count();
+                if appended <= row_count && cached_rows + appended >= row_count {
+                    let evicted = cached_rows + appended - row_count;
+                    let mut body = cached.body;
+                    body.drop_front(evicted);
+                    for row in rows.iter().skip(row_count - appended) {
+                        body.push_row(row);
+                    }
+                    body
+                } else {
+                    build_body_text(rows.iter())
+                }
+            }
+            _ => build_body_text(rows.iter()),
+        };
         self.body = Some(CachedBody {
             revision,
-            body: build_body_text(block.output().iter()),
+            total,
+            body,
         });
         self.selection = None;
         self.dragging = false;
@@ -128,18 +167,30 @@ impl BlockUiState {
         self.scroll_accum = 0.0;
     }
 
-    /// Relative age is stable within one wall-clock second; blocks under one
-    /// second only need the cached string.
-    pub(super) fn relative_label(&mut self, block: &Block, now: SystemTime) -> String {
+    /// Header snapshot with the relative age cached within one wall-clock
+    /// second, so idle frames do not reallocate command/status/meta strings.
+    pub(super) fn header_snapshot(&mut self, block: &Block, now: SystemTime) -> Rc<CardSnapshot> {
         let second = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if let Some((cached_second, label)) = &self.relative
-            && *cached_second == second
+        let command = block.command().unwrap_or("…");
+        if let Some(cached) = &self.header
+            && cached.second == second
+            && cached.revision == block.output_revision()
+            && cached.status == block.status()
+            && cached.command == command
         {
-            return label.clone();
+            return cached.snapshot.clone();
         }
-        let label = format_relative(block.started_wall(), now);
-        self.relative = Some((second, label.clone()));
-        label
+
+        let relative = format_relative(block.started_wall(), now);
+        let snapshot = Rc::new(card_snapshot_with_relative(block, relative));
+        self.header = Some(CachedHeader {
+            revision: block.output_revision(),
+            status: block.status(),
+            second,
+            command: command.to_owned(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
     }
 
     /// Positions the visible window, queues a slice when its key changed, and

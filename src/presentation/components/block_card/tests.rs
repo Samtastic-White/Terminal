@@ -81,6 +81,43 @@ fn a_trailing_blank_row_stays_addressable() {
 }
 
 #[test]
+fn incremental_append_matches_a_fresh_build() {
+    let mut body = build_body_text(&[row("a"), Row::default()]);
+    body.push_row(&row("c"));
+    body.push_row(&row("d"));
+
+    let fresh = build_body_text(&[row("a"), Row::default(), row("c"), row("d")]);
+    assert_eq!(body.text(), fresh.text());
+    assert_eq!(body.row_count(), fresh.row_count());
+    assert_eq!(body.runs(), fresh.runs());
+    assert_eq!(body.slice(0, 4, None), fresh.slice(0, 4, None));
+}
+
+#[test]
+fn front_drop_keeps_offsets_relative_without_compaction() {
+    let mut body = build_body_text(&[row("a"), row("b"), row("c")]);
+    body.drop_front(1);
+
+    let fresh = build_body_text(&[row("b"), row("c")]);
+    assert_eq!(body.row_count(), 2);
+    assert_eq!(body.slice(0, 2, None), fresh.slice(0, 2, None));
+    assert_eq!(body.slice(0, 2, None).start_byte(), 0);
+}
+
+#[test]
+fn front_drop_reclaims_evicted_bytes_once_they_dominate() {
+    let long = "x".repeat(400);
+    let rows: Vec<Row> = (0..300).map(|_| row(&long)).collect();
+    let mut body = build_body_text(rows.iter());
+    body.drop_front(200);
+
+    let fresh = build_body_text(rows.iter().skip(200));
+    assert_eq!(body.row_count(), 100);
+    assert_eq!(body.text(), fresh.text());
+    assert_eq!(body.slice(10, 20, None), fresh.slice(10, 20, None));
+}
+
+#[test]
 fn selection_splits_runs_and_keeps_styles() {
     let bold = TextStyle {
         bold: true,
