@@ -9,6 +9,8 @@ use crate::domain::output::Row;
 pub struct BoundedRows {
     rows: VecDeque<Row>,
     cap: usize,
+    /// Monotonic count of every row ever pushed, including evicted ones.
+    pushed: u64,
 }
 
 impl BoundedRows {
@@ -17,11 +19,13 @@ impl BoundedRows {
         Self {
             rows: VecDeque::new(),
             cap,
+            pushed: 0,
         }
     }
 
     /// Appends a row, returning true when the oldest row was evicted.
     pub fn push(&mut self, row: Row) -> bool {
+        self.pushed = self.pushed.wrapping_add(1);
         if self.cap == 0 {
             return false;
         }
@@ -44,6 +48,11 @@ impl BoundedRows {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Total rows ever pushed, monotonic even after eviction.
+    pub fn pushed(&self) -> u64 {
+        self.pushed
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Row> {
@@ -114,6 +123,17 @@ mod tests {
 
         assert_eq!(rows.len(), 3);
         assert_eq!(texts(&rows), vec!["9997", "9998", "9999"]);
+    }
+
+    #[test]
+    fn push_counter_counts_evicted_rows() {
+        let mut rows = BoundedRows::new(1);
+
+        rows.push(row("a"));
+        rows.push(row("b"));
+
+        assert_eq!(rows.pushed(), 2);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

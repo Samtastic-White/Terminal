@@ -71,6 +71,8 @@ impl Focusable for TerminalWindow {
 
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::probe::record_frame();
+
         if !self.did_focus {
             window.focus(&self.focus_handle, cx);
             self.did_focus = true;

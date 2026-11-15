@@ -11,7 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gpui::*;
 
@@ -21,10 +22,10 @@ use crate::domain::size::TerminalSize;
 use crate::presentation::components::block_card::BlockUiState;
 use crate::presentation::theme::TerminalTheme;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
-/// Maximum chunks parsed per wake; remaining chunks wait for the next timer
-/// tick so output ingestion never monopolizes a frame.
-const MAX_CHUNKS_PER_WAKE: usize = 8;
+/// Chunks are parsed in bounded slices so one burst never monopolizes a frame.
+const DRAIN_BUDGET: Duration = Duration::from_millis(4);
+/// Yield after an exhausted budget; keeps the window painting under load.
+const CONTINUE_POLL: Duration = Duration::from_millis(1);
 
 /// One session rendered as styled rows.
 pub struct TerminalWindow {
@@ -50,28 +51,49 @@ impl TerminalWindow {
     pub fn new(
         session_service: SessionService,
         pty_receiver: Receiver<Vec<u8>>,
+        pty_waker: Receiver<()>,
         cx: &mut Context<Self>,
     ) -> Self {
         let theme = TerminalTheme::default();
 
         // Bounded channel consumer that never runs on the render thread.
-        // `try_recv` drains what is available, then parks on the timer; every
-        // batch notifies the entity so the next frame renders the new rows.
+        // Draining runs under a short budget; when no chunks are buffered the
+        // loop parks on the coalesced reader signal instead of polling, and
+        // the blocking wait runs on a background worker.
+        let wake_receiver = Arc::new(Mutex::new(pty_waker));
         let _drain_task = cx.spawn(async move |this, cx| {
+            let mut wake_closed = false;
             loop {
-                let closed = this.update(cx, |this, cx| {
-                    let (changed, closed) = this.drain_output();
+                let (closed, more) = match this.update(cx, |this, cx| {
+                    let (changed, closed, more) = this.drain_output(Instant::now());
                     if changed {
                         cx.notify();
                     }
-                    closed
-                });
-                match closed {
-                    Ok(true) => break,
-                    Ok(false) => {}
+                    (closed, more)
+                }) {
+                    Ok(result) => result,
                     Err(_) => break, // view released
+                };
+                if closed {
+                    break;
                 }
-                cx.background_executor().timer(POLL_INTERVAL).await;
+                if more {
+                    cx.background_executor().timer(CONTINUE_POLL).await;
+                    continue;
+                }
+                if wake_closed {
+                    // Reader gone and nothing buffered: the final drain above
+                    // already saw the disconnect or there is no wake source.
+                    break;
+                }
+                let receiver = wake_receiver.clone();
+                let woke = cx
+                    .background_executor()
+                    .spawn(async move { receiver.lock().unwrap().recv().is_ok() })
+                    .await;
+                if !woke {
+                    wake_closed = true;
+                }
             }
         });
 
@@ -90,30 +112,27 @@ impl TerminalWindow {
         }
     }
 
-    /// Consumes every chunk currently buffered. Returns `(changed, closed)`:
-    /// `changed` means the session state grew; `closed` means the reader
-    /// channel disconnected and the final partial row was flushed.
-    fn drain_output(&mut self) -> (bool, bool) {
+    /// Consumes chunks for at most `DRAIN_BUDGET`, returning
+    /// `(changed, closed, more)`.
+    fn drain_output(&mut self, started: Instant) -> (bool, bool, bool) {
         let mut changed = false;
-        let mut drained = 0;
-        while drained < MAX_CHUNKS_PER_WAKE {
+        while started.elapsed() < DRAIN_BUDGET {
             match self.pty_receiver.try_recv() {
                 Ok(chunk) => {
                     self.session_service.ingest_bytes(&chunk);
                     changed = true;
-                    drained += 1;
                 }
-                Err(TryRecvError::Empty) => return (changed, false),
+                Err(TryRecvError::Empty) => return (changed, false, false),
                 Err(TryRecvError::Disconnected) => {
                     if !self.stream_closed {
                         self.session_service.finalize_stream();
                         self.stream_closed = true;
                         changed = true;
                     }
-                    return (changed, true);
+                    return (changed, true, false);
                 }
             }
         }
-        (changed, false)
+        (changed, false, true)
     }
 }

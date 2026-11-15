@@ -36,6 +36,10 @@ fn main() {
             tracing::error!("pty channel unavailable");
             return;
         };
+        let Some(pty_waker) = pty_adapter.take_waker() else {
+            tracing::error!("pty wake channel unavailable");
+            return;
+        };
         let session_service = SessionService::new(Box::new(pty_adapter), Box::new(block_writer));
 
         let window = cx.open_window(
@@ -47,7 +51,9 @@ fn main() {
                 ))),
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|cx| TerminalWindow::new(session_service, pty_receiver, cx)),
+            move |_window, cx| {
+                cx.new(|cx| TerminalWindow::new(session_service, pty_receiver, pty_waker, cx))
+            },
         );
         if let Err(error) = window {
             tracing::error!(error = %error, "window open failed");
