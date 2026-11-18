@@ -13,6 +13,7 @@ use super::snapshot::{CardSnapshot, card_snapshot_with_relative};
 use super::view::body_text_runs;
 use crate::application::block::format_relative;
 use crate::domain::block::{Block, BlockStatus};
+use crate::domain::output::Row;
 use crate::presentation::theme::TerminalTheme;
 
 /// Maximum visual lines a card body shows before scrolling locally.
@@ -42,6 +43,7 @@ impl Selection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BodyKey {
     revision: u64,
+    live_revision: u64,
     start_row: usize,
     end_row: usize,
     selection: Option<(usize, usize)>,
@@ -90,6 +92,8 @@ pub struct BlockUiState {
     selection: Option<Selection>,
     dragging: bool,
     body: Option<CachedBody>,
+    live: Option<Row>,
+    live_revision: u64,
     pub(super) pending: Option<PendingBody>,
     pub(super) layout: Option<BodyLayout>,
     layout_key: Option<BodyKey>,
@@ -111,6 +115,8 @@ impl BlockUiState {
             selection: None,
             dragging: false,
             body: None,
+            live: None,
+            live_revision: 0,
             pending: None,
             layout: None,
             layout_key: None,
@@ -167,6 +173,20 @@ impl BlockUiState {
         self.scroll_accum = 0.0;
     }
 
+    /// Caches the in-progress row separately from committed rows. A change
+    /// bumps `live_revision`, which invalidates only the visible slice.
+    pub(super) fn set_live(&mut self, live: Option<&Row>) -> bool {
+        if self.live.as_ref() == live {
+            return false;
+        }
+        self.live = live.cloned();
+        self.live_revision = self.live_revision.wrapping_add(1);
+        self.pending = None;
+        self.layout = None;
+        self.layout_key = None;
+        true
+    }
+
     /// Header snapshot with the relative age cached within one wall-clock
     /// second, so idle frames do not reallocate command/status/meta strings.
     pub(super) fn header_snapshot(&mut self, block: &Block, now: SystemTime) -> Rc<CardSnapshot> {
@@ -193,12 +213,20 @@ impl BlockUiState {
         snapshot
     }
 
+    /// Header snapshot cached by the latest card render, read by the sticky
+    /// overlay without recomputing relative time.
+    pub fn snapshot(&self) -> Option<Rc<CardSnapshot>> {
+        self.header.as_ref().map(|cached| cached.snapshot.clone())
+    }
+
     /// Positions the visible window, queues a slice when its key changed, and
     /// returns the body height in pixels. Rows are pre-wrapped to the PTY
     /// width, so one row is always one visual line.
     pub(super) fn prepare_body(&mut self, theme: &TerminalTheme) -> Option<Pixels> {
         let revision = self.body.as_ref()?.revision;
-        let rows = self.body.as_ref()?.body.row_count();
+        let committed_rows = self.body.as_ref()?.body.row_count();
+        let has_live = self.live.is_some();
+        let rows = committed_rows + usize::from(has_live);
         if rows == 0 {
             return None;
         }
@@ -218,6 +246,7 @@ impl BlockUiState {
             .map(Selection::range);
         let key = BodyKey {
             revision,
+            live_revision: self.live_revision,
             start_row: self.body_scroll,
             end_row,
             selection: selection.as_ref().map(|range| (range.start, range.end)),
@@ -225,16 +254,28 @@ impl BlockUiState {
         let line_height = px(theme.font_size * theme.line_height);
 
         if self.layout_key != Some(key) || self.layout.is_none() {
-            let slice = self
-                .body
-                .as_ref()?
-                .body
-                .slice(self.body_scroll, end_row, selection);
-            let runs = body_text_runs(&slice, theme);
-            let slice_start_byte = slice.start_byte();
-            let slice_end_byte = slice_start_byte + slice.text().len();
+            let (text, runs, slice_start_byte, slice_end_byte) = {
+                let mut slice =
+                    self.body
+                        .as_ref()?
+                        .body
+                        .slice(self.body_scroll, end_row, selection);
+                // Selection offsets cover committed bytes only; the live row
+                // is appended after they are captured.
+                let committed_len = slice.text().len();
+                if let Some(live) = &self.live {
+                    slice.push_live_row(live);
+                }
+                let slice_start_byte = slice.start_byte();
+                (
+                    slice.text().to_owned(),
+                    body_text_runs(&slice, theme),
+                    slice_start_byte,
+                    slice_start_byte + committed_len,
+                )
+            };
             self.pending = Some(PendingBody {
-                text: slice.text().to_owned(),
+                text,
                 runs,
                 line_height,
                 slice_start_byte,
@@ -245,6 +286,22 @@ impl BlockUiState {
         }
 
         Some(px(line_height.as_f32() * visible as f32))
+    }
+
+    /// Whether the body currently has a non-empty selection.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .is_some_and(|selection| !selection.is_empty())
+    }
+
+    /// Plain text of the body selection, limited to committed rows.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self
+            .selection
+            .filter(|selection| !selection.is_empty())?
+            .range();
+        let body = self.body.as_ref()?.body.selected_text(selection);
+        (!body.is_empty()).then_some(body)
     }
 
     /// Maps a window position over the body to an absolute byte offset in the

@@ -16,7 +16,7 @@ pub struct BlockLimits {
     pub block_max_rows: usize,
     pub session_max_rows: usize,
     pub session_max_blocks: usize,
-    pub prompt_max_rows: usize,
+    pub feedback_max_rows: usize,
     pub silence_max_rows: usize,
 }
 
@@ -26,7 +26,7 @@ impl Default for BlockLimits {
             block_max_rows: 4_000,
             session_max_rows: 8_000,
             session_max_blocks: 128,
-            prompt_max_rows: 100,
+            feedback_max_rows: 3,
             silence_max_rows: 32,
         }
     }
@@ -39,7 +39,10 @@ pub struct BlockService {
     limits: BlockLimits,
     machine: BlockStateMachine,
     blocks: Vec<Block>,
-    prompt_rows: BoundedRows,
+    pending: Option<String>,
+    awaiting_start: bool,
+    feedback: BoundedRows,
+    restored: Option<String>,
     silence_rows: BoundedRows,
     last_cwd: Option<PathBuf>,
     total_rows: usize,
@@ -59,7 +62,10 @@ impl BlockService {
             limits,
             machine: BlockStateMachine::new(),
             blocks: Vec::new(),
-            prompt_rows: BoundedRows::new(limits.prompt_max_rows),
+            pending: None,
+            awaiting_start: false,
+            feedback: BoundedRows::new(limits.feedback_max_rows),
+            restored: None,
             silence_rows: BoundedRows::new(limits.silence_max_rows),
             last_cwd: None,
             total_rows: 0,
@@ -78,21 +84,104 @@ impl BlockService {
         &self.blocks
     }
 
-    /// Committed rows of the prompt currently being drawn.
-    pub fn prompt_rows(&self) -> &BoundedRows {
-        &self.prompt_rows
+    /// Rows received while a submission waits for `C` or `D`.
+    pub fn feedback_rows(&self) -> &BoundedRows {
+        &self.feedback
     }
 
-    /// Live surface row, exposed only while it belongs to a rendered region.
+    /// Text submitted but not yet attached to a block.
+    // The editor dock derives its locked content from this in T6.
+    #[allow(dead_code)]
+    pub fn pending_text(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// True from submission until the next `A` unlocks the editor.
+    pub fn awaiting_start(&self) -> bool {
+        self.awaiting_start
+    }
+
+    /// True after the shell ended or the terminal reset.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Starts the submission lifecycle: the text is retained until `C`
+    /// attaches it or `D` restores it.
+    pub fn begin_submission(&mut self, text: String) {
+        self.pending = Some(text);
+        self.awaiting_start = true;
+        self.feedback.clear();
+    }
+
+    /// Moves a restored submission out for the editor to refill.
+    pub fn take_restored(&mut self) -> Option<String> {
+        self.restored.take()
+    }
+
+    /// Drops a pending submission on explicit `Ctrl+C` and returns its text.
+    pub fn abort_pending(&mut self) -> Option<String> {
+        self.awaiting_start = false;
+        self.feedback.clear();
+        self.pending.take()
+    }
+
+    /// Clears transient shell feedback after the user edits the text.
+    pub fn clear_feedback(&mut self) {
+        self.feedback.clear();
+    }
+
+    /// Newest-first command history derived from opened blocks.
+    pub fn history_len(&self) -> usize {
+        let mut seen: Option<&str> = None;
+        let mut len = 0;
+        for block in self.blocks.iter().rev() {
+            if block.is_running() {
+                continue;
+            }
+            let Some(command) = block.command() else {
+                continue;
+            };
+            if command.is_empty() || seen == Some(command) {
+                continue;
+            }
+            seen = Some(command);
+            len += 1;
+        }
+        len
+    }
+
+    /// One history entry, zero-based and newest first.
+    pub fn history_entry(&self, index: usize) -> Option<&str> {
+        let mut seen: Option<&str> = None;
+        let mut rank = 0;
+        for block in self.blocks.iter().rev() {
+            if block.is_running() {
+                continue;
+            }
+            let Some(command) = block.command() else {
+                continue;
+            };
+            if command.is_empty() || seen == Some(command) {
+                continue;
+            }
+            seen = Some(command);
+            if rank == index {
+                return Some(command);
+            }
+            rank += 1;
+        }
+        None
+    }
+
+    /// Live surface row, exposed only while it belongs to a running block.
     pub fn live_row(
         &self,
         surface_row: Option<crate::domain::output::Row>,
     ) -> Option<crate::domain::output::Row> {
         match self.machine.phase() {
-            ShellPhase::Running | ShellPhase::Prompting { prompt_open: true } => surface_row,
-            ShellPhase::Cold
-            | ShellPhase::Prompting { prompt_open: false }
-            | ShellPhase::Closed => None,
+            ShellPhase::Running => surface_row,
+            ShellPhase::Cold | ShellPhase::Prompting { .. } | ShellPhase::Closed => None,
         }
     }
 
@@ -135,11 +224,11 @@ impl BlockService {
                 "block interrupted"
             );
         }
-        self.closed = true;
-        self.prompt_rows.clear();
-        self.silence_rows.clear();
+        self.close();
     }
 
+    /// Rows at the prompt are feedback while a submission is pending and
+    /// silence otherwise.
     fn push_row(&mut self, row: crate::domain::output::Row) {
         match self.machine.phase() {
             ShellPhase::Running => {
@@ -151,11 +240,12 @@ impl BlockService {
                 }
                 self.enforce_budgets();
             }
-            ShellPhase::Prompting { prompt_open: true } => {
-                self.prompt_rows.push(row);
-            }
-            ShellPhase::Prompting { prompt_open: false } | ShellPhase::Cold => {
-                self.silence_rows.push(row);
+            ShellPhase::Prompting { .. } | ShellPhase::Cold => {
+                if self.pending.is_some() {
+                    self.feedback.push(row);
+                } else {
+                    self.silence_rows.push(row);
+                }
             }
             ShellPhase::Closed => {}
         }
@@ -176,29 +266,54 @@ impl BlockService {
                     block.set_command(text);
                 }
             }
-            SemanticEvent::PromptStart
-            | SemanticEvent::PromptEnd
+            SemanticEvent::PromptStart => {
+                // A prompt redraw after a failed submission produces no
+                // machine transition, but it must still release the editor.
+                if self.awaiting_start && self.pending.is_none() {
+                    self.awaiting_start = false;
+                }
+            }
+            SemanticEvent::PromptEnd
             | SemanticEvent::CommandStart
-            | SemanticEvent::CommandFinished { .. }
             | SemanticEvent::TerminalReset => {}
+            SemanticEvent::CommandFinished { .. } => self.restore_unstarted_command(),
+        }
+    }
+
+    /// `D` while still prompting means the command never opened a block
+    /// (syntax error, continuation abort): keep the feedback and hand the
+    /// pending text back to the editor.
+    fn restore_unstarted_command(&mut self) {
+        if matches!(self.machine.phase(), ShellPhase::Prompting { .. })
+            && let Some(text) = self.pending.take()
+        {
+            self.restored = Some(text);
         }
     }
 
     fn apply_transitions(&mut self, transitions: Vec<Transition>, at: Timestamp) {
         for transition in transitions {
             match transition {
-                Transition::PromptOpened => self.prompt_rows.clear(),
+                Transition::PromptOpened => {
+                    // The raw `A` item owns the unlock: a redrawn prompt emits
+                    // no transition and must release the editor too.
+                }
                 Transition::BlockOpened => {
-                    self.prompt_rows.clear();
+                    let pending = self.pending.take();
                     let id = BlockId::new(self.next_id);
                     self.next_id = self.next_id.wrapping_add(1);
-                    self.blocks.push(Block::running(
+                    let mut block = Block::running(
                         id,
                         self.last_cwd.clone(),
                         at.wall,
                         at.mono,
                         self.limits.block_max_rows,
-                    ));
+                    );
+                    if let Some(text) = pending {
+                        block.set_command(text);
+                    }
+                    self.blocks.push(block);
+                    self.feedback.clear();
                     debug!(block_id = id.get(), "block opened");
                     self.enforce_budgets();
                 }
@@ -229,13 +344,20 @@ impl BlockService {
                         );
                     }
                 }
-                Transition::Closed => {
-                    self.closed = true;
-                    self.prompt_rows.clear();
-                    self.silence_rows.clear();
-                }
+                Transition::Closed => self.close(),
             }
         }
+    }
+
+    /// Terminal end: pending text becomes restorable, transient rings clear.
+    fn close(&mut self) {
+        if let Some(text) = self.pending.take() {
+            self.restored = Some(text);
+        }
+        self.awaiting_start = false;
+        self.feedback.clear();
+        self.silence_rows.clear();
+        self.closed = true;
     }
 
     /// Oldest completed blocks are evicted first; the running block is never

@@ -93,18 +93,167 @@ fn full_lifecycle_produces_a_completed_block() {
 }
 
 #[test]
-fn prompt_rows_clear_when_the_command_starts() {
+fn feedback_rows_route_to_the_pending_submission() {
     let clock = Clock::new();
     let mut service = BlockService::default();
 
     service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
-    service.handle_items(vec![row("prompt$ ")], clock.at(0));
-    assert_eq!(service.prompt_rows().len(), 1);
+    service.begin_submission("if true".into());
+    service.handle_items(vec![row("syntax error")], clock.at(1));
 
-    service.handle_items(vec![event(SemanticEvent::CommandStart)], clock.at(0));
+    assert_eq!(service.feedback_rows().len(), 1);
+    assert_eq!(service.pending_text(), Some("if true"));
 
-    assert!(service.prompt_rows().is_empty());
-    assert_eq!(service.blocks().len(), 1);
+    finish_block(&mut service, &clock, 2, 1);
+
+    assert_eq!(service.take_restored(), Some("if true".into()));
+    assert!(service.awaiting_start());
+    assert_eq!(service.feedback_rows().len(), 1);
+}
+
+#[test]
+fn rows_without_a_pending_submission_are_silenced() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.handle_items(vec![row("async notice")], clock.at(1));
+
+    assert!(service.feedback_rows().is_empty());
+    assert!(service.pending_text().is_none());
+}
+
+#[test]
+fn block_opened_attaches_pending_text_before_the_command_line_marker() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("echo submitted".into());
+    service.handle_items(vec![row("feedback")], clock.at(1));
+    assert_eq!(service.feedback_rows().len(), 1);
+
+    service.handle_items(vec![event(SemanticEvent::CommandStart)], clock.at(2));
+    service.handle_items(
+        vec![event(SemanticEvent::CommandLine {
+            text: "echo other".into(),
+        })],
+        clock.at(2),
+    );
+
+    assert_eq!(service.blocks()[0].command(), Some("echo submitted"));
+    assert!(service.pending_text().is_none());
+    assert!(service.feedback_rows().is_empty());
+}
+
+#[test]
+fn prompt_open_unlocks_after_the_pending_text_was_attached() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("echo hi".into());
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(1));
+    assert!(service.awaiting_start());
+
+    service.handle_items(vec![event(SemanticEvent::CommandStart)], clock.at(2));
+    finish_block(&mut service, &clock, 3, 0);
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(4));
+
+    assert!(!service.awaiting_start());
+}
+
+#[test]
+fn a_redrawn_prompt_unlocks_after_a_failed_submission() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("bad syntax".into());
+    service.handle_items(
+        vec![event(SemanticEvent::CommandFinished { exit_code: 1 })],
+        clock.at(1),
+    );
+    assert!(service.awaiting_start());
+    assert_eq!(service.take_restored(), Some("bad syntax".into()));
+
+    // The shell never left the prompt, so its new `A` is a duplicate and
+    // produces no machine transition.
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(2));
+
+    assert!(!service.awaiting_start());
+}
+
+#[test]
+fn abort_pending_returns_the_text_and_clears_feedback() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("broken".into());
+    service.handle_items(vec![row("feedback")], clock.at(1));
+
+    assert_eq!(service.abort_pending(), Some("broken".into()));
+    assert!(!service.awaiting_start());
+    assert!(service.feedback_rows().is_empty());
+    assert!(service.pending_text().is_none());
+}
+
+#[test]
+fn session_end_restores_pending_text_and_clears_feedback() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("pending command".into());
+    service.handle_items(vec![row("feedback")], clock.at(1));
+
+    service.session_ended(clock.at(2));
+
+    assert!(service.is_closed());
+    assert_eq!(service.take_restored(), Some("pending command".into()));
+    assert!(service.feedback_rows().is_empty());
+}
+
+#[test]
+fn the_feedback_ring_drops_the_oldest_row_at_its_cap() {
+    let clock = Clock::new();
+    let mut service = BlockService::new(BlockLimits {
+        block_max_rows: 4,
+        session_max_rows: 100,
+        session_max_blocks: 8,
+        feedback_max_rows: 2,
+        silence_max_rows: 4,
+    });
+
+    service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
+    service.begin_submission("cmd".into());
+    service.handle_items(vec![row("first"), row("second"), row("third")], clock.at(1));
+
+    let texts: Vec<String> = service
+        .feedback_rows()
+        .iter()
+        .map(|row| row.spans.iter().map(|span| span.text.as_str()).collect())
+        .collect();
+    assert_eq!(texts, ["second", "third"]);
+}
+
+#[test]
+fn history_is_newest_first_and_collapses_consecutive_duplicates() {
+    let clock = Clock::new();
+    let mut service = BlockService::default();
+
+    for (index, command) in ["one", "one", "two"].iter().enumerate() {
+        let second = index as u64 * 2;
+        open_block(&mut service, &clock, second, Some(command));
+        finish_block(&mut service, &clock, second + 1, 0);
+    }
+    open_block(&mut service, &clock, 6, Some("running"));
+
+    assert_eq!(service.history_len(), 2);
+    assert_eq!(service.history_entry(0), Some("two"));
+    assert_eq!(service.history_entry(1), Some("one"));
+    assert_eq!(service.history_entry(2), None);
 }
 
 #[test]
@@ -188,7 +337,7 @@ fn session_rows_evict_completed_blocks_before_the_running_one() {
         block_max_rows: 4,
         session_max_rows: 3,
         session_max_blocks: 8,
-        prompt_max_rows: 4,
+        feedback_max_rows: 4,
         silence_max_rows: 4,
     });
 
@@ -211,7 +360,7 @@ fn the_running_block_is_never_evicted_by_the_session_row_budget() {
         block_max_rows: 4,
         session_max_rows: 1,
         session_max_blocks: 8,
-        prompt_max_rows: 4,
+        feedback_max_rows: 4,
         silence_max_rows: 4,
     });
 
@@ -229,7 +378,7 @@ fn session_block_budget_evicts_the_oldest_completed_block() {
         block_max_rows: 4,
         session_max_rows: 100,
         session_max_blocks: 2,
-        prompt_max_rows: 4,
+        feedback_max_rows: 4,
         silence_max_rows: 4,
     });
 
@@ -246,7 +395,7 @@ fn session_block_budget_evicts_the_oldest_completed_block() {
 }
 
 #[test]
-fn live_row_is_visible_only_in_prompt_and_running_windows() {
+fn live_row_is_visible_only_while_running() {
     let clock = Clock::new();
     let mut service = BlockService::default();
     let live = || Some(Row::default());
@@ -254,7 +403,7 @@ fn live_row_is_visible_only_in_prompt_and_running_windows() {
     assert!(service.live_row(live()).is_none());
 
     service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(0));
-    assert!(service.live_row(live()).is_some());
+    assert!(service.live_row(live()).is_none());
 
     service.handle_items(vec![event(SemanticEvent::CommandStart)], clock.at(1));
     assert!(service.live_row(live()).is_some());
@@ -266,7 +415,7 @@ fn live_row_is_visible_only_in_prompt_and_running_windows() {
     assert!(service.live_row(live()).is_none());
 
     service.handle_items(vec![event(SemanticEvent::PromptStart)], clock.at(3));
-    assert!(service.live_row(live()).is_some());
+    assert!(service.live_row(live()).is_none());
 
     service.session_ended(clock.at(4));
     assert!(service.live_row(live()).is_none());

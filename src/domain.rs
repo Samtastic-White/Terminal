@@ -4,6 +4,8 @@
 //! it stays 100% headless-testable.
 
 pub mod block;
+pub mod editor;
+pub mod keymap;
 pub mod output;
 pub mod pty;
 pub mod rows;

@@ -47,6 +47,18 @@ pub fn status_tone(status: BlockStatus) -> StatusTone {
     }
 }
 
+/// First logical line of a submitted command, ellipsized when the command
+/// spans more lines. Clipboard extraction always keeps the full text.
+pub fn command_preview(block: &Block) -> String {
+    let Some(command) = block.command() else {
+        return "…".into();
+    };
+    match command.split_once('\n') {
+        Some((first, _)) => format!("{first}…"),
+        None => command.to_owned(),
+    }
+}
+
 /// Everything the header paints for one block, plus whether a body exists.
 #[cfg(test)]
 pub fn card_snapshot(block: &Block, now: SystemTime) -> CardSnapshot {
@@ -61,7 +73,7 @@ pub fn card_snapshot_with_relative(block: &Block, relative: String) -> CardSnaps
         None => relative,
     };
     CardSnapshot {
-        command: block.command().unwrap_or("…").to_owned(),
+        command: command_preview(block),
         status_label: status_label(block.status()),
         tone: status_tone(block.status()),
         meta,

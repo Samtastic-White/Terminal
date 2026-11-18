@@ -4,8 +4,8 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::application::session::SessionService;
-use crate::domain::block::{Block, BlockStatus};
+use crate::application::session::{EditCommand, EditorState, SessionService, SubmitOutcome};
+use crate::domain::block::{Block, BlockStatus, CopyKind};
 use crate::domain::output::{Color, Row};
 use crate::domain::pty::PtyPort;
 use crate::domain::semantic::ShellPhase;
@@ -61,7 +61,7 @@ impl PtyPort for NullPty {
     }
 }
 
-fn drain_until_prompt_open(
+fn drain_until_editor_idle(
     receiver: &mut Receiver<Vec<u8>>,
     service: &mut SessionService,
     deadline: Duration,
@@ -74,9 +74,7 @@ fn drain_until_prompt_open(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return false,
         }
-        if matches!(service.phase(), ShellPhase::Prompting { prompt_open: true })
-            && service.live_row().is_some()
-        {
+        if service.editor_state() == EditorState::Idle {
             return true;
         }
     }
@@ -122,6 +120,18 @@ fn drain_for(receiver: &mut Receiver<Vec<u8>>, service: &mut SessionService, dur
     }
 }
 
+fn spawn_service() -> (Receiver<Vec<u8>>, SessionService) {
+    let mut adapter = PtyAdapter::new();
+    adapter.spawn(TerminalSize::new(80, 24)).unwrap();
+    let receiver = adapter.take_output().unwrap();
+    let service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
+    (receiver, service)
+}
+
+fn feedback_text(service: &SessionService) -> Vec<String> {
+    service.feedback_rows().iter().map(row_text).collect()
+}
+
 #[test]
 fn measure_flag_accepts_only_one() {
     assert!(measure_enabled_from(Some("1")));
@@ -146,29 +156,14 @@ fn raw_bytes_flow_into_a_completed_block() {
 }
 
 #[test]
-fn live_prompt_and_typing_render_before_the_command_starts() {
+fn live_row_renders_only_inside_a_running_block() {
     let mut service = SessionService::new(Box::new(NullPty), Box::new(BlockTextWriter::new(80)));
 
-    service.ingest_bytes(b"\x1b]133;A\x1b\\\x1b[32muser@host:~$ \x1b[0m");
+    service.ingest_bytes(b"\x1b]133;A\x1b\\");
     assert!(service.blocks().is_empty());
-    let prompt = service.live_row().expect("prompt must be live");
-    assert_eq!(row_text(&prompt), "user@host:~$ ");
-    assert_eq!(prompt.spans[0].style.fg, Color::Indexed(2));
-
-    service.ingest_bytes(b"ls");
-    assert_eq!(
-        row_text(&service.live_row().expect("typing must be live")),
-        "user@host:~$ ls"
-    );
-    assert!(service.prompt_rows().is_empty());
-
-    service.ingest_bytes(b"\r\n");
     assert!(service.live_row().is_none());
-    let committed: Vec<String> = service.prompt_rows().iter().map(row_text).collect();
-    assert_eq!(committed, ["user@host:~$ ls"]);
 
     service.ingest_bytes(b"\x1b]133;B\x1b\\\x1b]133;C\x1b\\");
-    assert!(service.prompt_rows().is_empty());
     assert_eq!(service.blocks().len(), 1);
 
     service.ingest_bytes(b"next");
@@ -212,7 +207,7 @@ fn engine_end_to_end_renders_colors_cjk_progress_and_resize() {
     let mut service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
 
     assert!(
-        drain_until_prompt_open(&mut receiver, &mut service, Duration::from_secs(5)),
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
         "the injected prompt marker must open the prompt window"
     );
 
@@ -259,9 +254,20 @@ fn engine_end_to_end_renders_colors_cjk_progress_and_resize() {
         "carriage-return rewrite must reach a block"
     );
 
+    service.set_editor_geometry(80, 3);
+    assert_eq!(
+        service.editor_visual_lines(),
+        3,
+        "the dock keeps a three-line editor while resizing"
+    );
+    service.edit(EditCommand::Insert("one\ntwo\nthree".to_owned()));
+    assert_eq!(service.editor().visual_line_count(), 3);
+
     service.resize(TerminalSize::new(100, 40)).unwrap();
+    service.edit(EditCommand::Clear);
+    service.edit(EditCommand::Insert("stty size".to_owned()));
     let target = service.blocks().len() + 1;
-    service.write_keystrokes(b"stty size\r").unwrap();
+    assert_eq!(service.submit(), SubmitOutcome::Submitted);
     assert!(
         drain_until_block_done(&mut receiver, &mut service, target, Duration::from_secs(5)),
         "stty size must complete"
@@ -285,12 +291,16 @@ fn empty_enter_and_ctrl_c_at_the_prompt_create_no_blocks() {
     let mut service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
 
     assert!(
-        drain_until_prompt_open(&mut receiver, &mut service, Duration::from_secs(5)),
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
         "the shell must reach its first prompt"
     );
     let before = service.blocks().len();
 
-    service.write_keystrokes(b"\r").unwrap();
+    assert_eq!(
+        service.submit(),
+        SubmitOutcome::Ignored,
+        "an empty Enter must not write to the PTY"
+    );
     drain_for(&mut receiver, &mut service, Duration::from_millis(400));
     assert_eq!(
         service.blocks().len(),
@@ -298,7 +308,7 @@ fn empty_enter_and_ctrl_c_at_the_prompt_create_no_blocks() {
         "an empty Enter must not open a block"
     );
 
-    service.write_keystrokes(b"\x03").unwrap();
+    service.interrupt();
     drain_for(&mut receiver, &mut service, Duration::from_millis(400));
     assert_eq!(
         service.blocks().len(),
@@ -318,13 +328,14 @@ fn failing_command_records_the_exit_status() {
     let mut receiver = adapter.take_output().unwrap();
     let mut service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
 
-    assert!(drain_until_prompt_open(
+    assert!(drain_until_editor_idle(
         &mut receiver,
         &mut service,
         Duration::from_secs(5)
     ));
     let target = service.blocks().len() + 1;
-    service.write_keystrokes(b"false\r").unwrap();
+    service.edit(EditCommand::Insert("false".to_owned()));
+    assert_eq!(service.submit(), SubmitOutcome::Submitted);
     assert!(
         drain_until_block_done(&mut receiver, &mut service, target, Duration::from_secs(5)),
         "false must complete"
@@ -340,13 +351,122 @@ fn failing_command_records_the_exit_status() {
 }
 
 #[test]
+fn multiline_submission_runs_once_and_keeps_the_full_command() {
+    let (mut receiver, mut service) = spawn_service();
+    assert!(
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
+        "the shell must reach its first prompt"
+    );
+    assert!(service.blocks().is_empty());
+    assert!(service.live_row().is_none());
+
+    let command = "for i in 1 2 3\ndo\necho \"line $i\"\ndone";
+    service.edit(EditCommand::Insert(command.to_owned()));
+    assert_eq!(service.submit(), SubmitOutcome::Submitted);
+    assert_eq!(service.editor_state(), EditorState::AwaitingStart);
+    assert!(service.editor().text().is_empty());
+
+    let target = service.blocks().len() + 1;
+    assert!(
+        drain_until_block_done(&mut receiver, &mut service, target, Duration::from_secs(5)),
+        "the multiline command must complete"
+    );
+    assert!(
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
+        "the next prompt must unlock the editor"
+    );
+
+    let block = service.blocks().last().expect("one completed block");
+    assert_eq!(block.status(), BlockStatus::Succeeded);
+    assert_eq!(block.command(), Some(command));
+    assert_eq!(
+        output_text(block),
+        ["line 1", "line 2", "line 3"],
+        "no prompt or submitted bytes may leak into the body"
+    );
+    assert_eq!(
+        service.copy_block(block.id(), CopyKind::Command).as_deref(),
+        Some(command),
+        "the command copy keeps every line break"
+    );
+    assert_eq!(service.blocks().len(), target);
+    assert_eq!(service.editor_state(), EditorState::Idle);
+}
+
+#[test]
+fn syntax_error_shows_feedback_and_restores_the_text() {
+    let (mut receiver, mut service) = spawn_service();
+    assert!(
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
+        "the shell must reach its first prompt"
+    );
+
+    let command = "echo )";
+    service.edit(EditCommand::Insert(command.to_owned()));
+    assert_eq!(service.submit(), SubmitOutcome::Submitted);
+
+    assert!(
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
+        "the parse error must return to a prompt"
+    );
+
+    assert!(
+        service.blocks().is_empty(),
+        "a parse error must not open a block"
+    );
+    assert_eq!(
+        service.editor().text(),
+        command,
+        "the pending text must be restored after D without C"
+    );
+    assert!(
+        feedback_text(&service)
+            .iter()
+            .any(|row| row.contains("parse error")),
+        "the shell error must stay as feedback, got {:?}",
+        feedback_text(&service)
+    );
+}
+
+#[test]
+fn ctrl_c_restores_a_command_stuck_at_a_continuation_prompt() {
+    let (mut receiver, mut service) = spawn_service();
+    assert!(
+        drain_until_editor_idle(&mut receiver, &mut service, Duration::from_secs(5)),
+        "the shell must reach its first prompt"
+    );
+
+    let command = "for i in 1 2 3";
+    service.edit(EditCommand::Insert(command.to_owned()));
+    assert_eq!(service.submit(), SubmitOutcome::Submitted);
+
+    // Let zsh consume the line and wait for the loop body.
+    drain_for(&mut receiver, &mut service, Duration::from_millis(300));
+    assert_eq!(service.editor_state(), EditorState::AwaitingStart);
+
+    service.interrupt();
+    assert_eq!(
+        service.editor().text(),
+        command,
+        "Ctrl+C must hand the pending text back immediately"
+    );
+
+    drain_for(&mut receiver, &mut service, Duration::from_millis(500));
+    assert_eq!(service.editor().text(), command);
+    assert!(
+        service.blocks().is_empty(),
+        "the aborted command must not open a block"
+    );
+}
+
+#[test]
 fn nested_zsh_does_not_create_a_nested_block() {
     let mut adapter = PtyAdapter::new();
     adapter.spawn(TerminalSize::new(80, 24)).unwrap();
     let mut receiver = adapter.take_output().unwrap();
     let mut service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
 
-    assert!(drain_until_prompt_open(
+    assert!(drain_until_editor_idle(
         &mut receiver,
         &mut service,
         Duration::from_secs(5)
@@ -381,7 +501,7 @@ fn streaming_output_keeps_the_block_bounded() {
     let mut receiver = adapter.take_output().unwrap();
     let mut service = SessionService::new(Box::new(adapter), Box::new(BlockTextWriter::new(80)));
 
-    assert!(drain_until_prompt_open(
+    assert!(drain_until_editor_idle(
         &mut receiver,
         &mut service,
         Duration::from_secs(5)

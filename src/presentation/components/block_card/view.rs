@@ -7,15 +7,24 @@ use std::time::SystemTime;
 
 use gpui::*;
 
-use super::actions::{CARD_ACTIONS, render_action};
+use super::actions::{ActionScope, CARD_ACTIONS, render_action};
 use super::body::BodySlice;
 use super::snapshot::{CardSnapshot, StatusTone};
 use super::state::{BlockUiState, BodyLayout, PendingBody};
-use crate::domain::block::{Block, BlockId, CopyKind};
+use crate::domain::block::{Block, BlockId, BlockStatus, CopyKind};
+use crate::domain::output::Row;
 use crate::presentation::theme::TerminalTheme;
 
 /// Click callback routed by the view to `SessionService::copy_block`.
 pub type CopyHandler = Rc<dyn Fn(CopyKind, &mut Window, &mut App)>;
+/// Notifies the window when a body selection becomes non-empty.
+pub type SelectionHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Per-card callbacks pre-wired by the session view.
+pub struct CardCallbacks {
+    pub on_copy: CopyHandler,
+    pub on_select: SelectionHandler,
+}
 
 pub(super) fn body_text_runs(slice: &BodySlice, theme: &TerminalTheme) -> Vec<TextRun> {
     slice
@@ -65,9 +74,10 @@ fn tone_color(tone: StatusTone, theme: &TerminalTheme) -> Rgba {
     }
 }
 
-fn render_header(
+pub(crate) fn render_header(
     snapshot: &CardSnapshot,
     block: BlockId,
+    scope: ActionScope,
     theme: &TerminalTheme,
     on_copy: &CopyHandler,
 ) -> impl IntoElement {
@@ -86,7 +96,7 @@ fn render_header(
     let actions = div().flex().flex_row().items_center().gap_1().children(
         CARD_ACTIONS
             .into_iter()
-            .map(|action| render_action(block, action, &group, theme, on_copy)),
+            .map(|action| render_action(block, action, scope, &group, theme, on_copy)),
     );
 
     div()
@@ -125,6 +135,7 @@ fn render_body(
     view: EntityId,
     font_size: Pixels,
     line_height: Pixels,
+    on_select: SelectionHandler,
 ) -> impl IntoElement {
     let prepaint_ui = ui.clone();
     let paint_ui = ui.clone();
@@ -215,11 +226,15 @@ fn render_body(
         })
         .on_mouse_move({
             let ui = ui.clone();
-            move |event, _window, cx| {
+            let on_select = on_select.clone();
+            move |event, window, cx| {
                 if event.pressed_button != Some(MouseButton::Left) {
                     return;
                 }
                 if ui.borrow_mut().extend_selection(event.position) {
+                    if ui.borrow().has_selection() {
+                        on_select(window, cx);
+                    }
                     cx.notify(view);
                 }
             }
@@ -244,21 +259,25 @@ fn render_body(
         .child(body)
 }
 
-/// One block card. Empty output renders the header only.
+/// One block card. Empty output renders the header only. `live` is the row
+/// still being built; it is shown only inside the running block.
 pub fn render_block_card(
     block: &Block,
+    live: Option<&Row>,
     theme: &TerminalTheme,
     now: SystemTime,
     ui: Rc<RefCell<BlockUiState>>,
     view: EntityId,
-    on_copy: CopyHandler,
+    callbacks: CardCallbacks,
 ) -> impl IntoElement {
     let line_height = px(theme.font_size * theme.line_height);
+    let live = live.filter(|_| block.status() == BlockStatus::Running);
     let (snapshot, body_height) = {
         let mut state = ui.borrow_mut();
         state.sync_body(block);
+        state.set_live(live);
         let snapshot = state.header_snapshot(block, now);
-        let body_height = if snapshot.has_body {
+        let body_height = if snapshot.has_body || live.is_some() {
             state.prepare_body(theme)
         } else {
             None
@@ -279,7 +298,13 @@ pub fn render_block_card(
         .bg(theme.card_background)
         .shadow_sm()
         .group(format!("block-{}", block.id().get()))
-        .child(render_header(&snapshot, block.id(), theme, &on_copy));
+        .child(render_header(
+            &snapshot,
+            block.id(),
+            ActionScope::Flow,
+            theme,
+            &callbacks.on_copy,
+        ));
 
     if let Some(height) = body_height {
         card = card.child(div().px(px(12.0)).pb(px(10.0)).child(render_body(
@@ -289,6 +314,7 @@ pub fn render_block_card(
             view,
             px(theme.font_size),
             line_height,
+            callbacks.on_select.clone(),
         )));
     }
 

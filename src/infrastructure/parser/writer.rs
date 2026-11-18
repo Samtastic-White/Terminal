@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use tracing::trace;
 use vte::{Parser, Perform};
 
+use crate::domain::keymap::TerminalModes;
 use crate::domain::output::{Row, TextStyle};
 use crate::domain::semantic::SemanticEvent;
 use crate::domain::size::TerminalSize;
@@ -50,6 +51,8 @@ struct Core {
     /// Addressable cells of the active row; `None` means never written.
     /// Bounded by `cols` plus mid-rewrite leftovers.
     active: Vec<Option<ActiveCell>>,
+    /// Private modes negotiated by the foreground application.
+    modes: TerminalModes,
     /// Committed rows and recognized semantic events awaiting transport.
     items: VecDeque<SurfaceItem>,
 }
@@ -95,7 +98,23 @@ impl Perform for Core {
         ignore: bool,
         action: char,
     ) {
-        if ignore || !intermediates.is_empty() {
+        if ignore {
+            trace!(family = "csi", "parser input ignored");
+            return;
+        }
+        if intermediates == *b"?" && matches!(action, 'h' | 'l') {
+            // Every parameter applies: `?1;2004h` still sets mode 1.
+            for group in params.iter() {
+                for &mode in group {
+                    if mode == 1 {
+                        self.modes.set_app_cursor(action == 'h');
+                        trace!(mode = 1, enabled = action == 'h', "terminal mode changed");
+                    }
+                }
+            }
+            return;
+        }
+        if !intermediates.is_empty() {
             trace!(family = "csi", "parser input ignored");
             return; // Malformed or unsupported: consumed silently.
         }
@@ -128,6 +147,8 @@ impl Perform for Core {
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, action: u8) {
         if !ignore && intermediates.is_empty() && action == b'c' {
+            // RIS: a later chunk must not inherit stale modes.
+            self.modes.reset();
             self.emit(SemanticEvent::TerminalReset);
         } else {
             // Charset shifts, DECALN, etc.: outside the subset, absorbed.
@@ -157,6 +178,7 @@ impl BlockTextWriter {
                 col: 0,
                 pending_wrap: false,
                 active: Vec::new(),
+                modes: TerminalModes::default(),
                 items: VecDeque::new(),
             },
         }
@@ -225,6 +247,10 @@ impl TerminalSurfacePort for BlockTextWriter {
 
     fn active_row(&self) -> Option<Row> {
         BlockTextWriter::active_row(self)
+    }
+
+    fn modes(&self) -> TerminalModes {
+        self.core.modes
     }
 
     fn flush(&mut self) -> Vec<SurfaceItem> {

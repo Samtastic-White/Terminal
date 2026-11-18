@@ -48,6 +48,8 @@ pub struct BodySlice {
     text: String,
     runs: Vec<SliceRun>,
     start_byte: usize,
+    /// Committed rows in the slice, even when their text is empty.
+    rows: usize,
 }
 
 /// One styled segment of a [`BodySlice`], already localized to the slice.
@@ -85,6 +87,27 @@ impl BodyText {
 
     pub fn row_count(&self) -> usize {
         self.row_starts.len() - self.first_row
+    }
+
+    /// Plain text for an absolute selection over the live body. The slice is
+    /// bounded to the rows the selection touches, so copying never duplicates
+    /// the whole block.
+    pub fn selected_text(&self, range: Range<usize>) -> String {
+        let live = &self.text[self.base_byte..];
+        let range = clamp_selection(range, live);
+        if range.is_empty() {
+            return String::new();
+        }
+
+        let rows = &self.row_starts[self.first_row..];
+        let start = self.base_byte + range.start;
+        let end = self.base_byte + range.end;
+        let start_row = rows
+            .partition_point(|row_start| *row_start <= start)
+            .saturating_sub(1);
+        let end_row = rows.partition_point(|row_start| *row_start <= end);
+        self.slice(start_row, end_row.max(start_row + 1), Some(range))
+            .selected_text()
     }
 
     /// Appends one row. Equivalent to one step of [`build_body_text`].
@@ -153,6 +176,7 @@ impl BodyText {
                 text: String::new(),
                 runs: Vec::new(),
                 start_byte: body_len,
+                rows: 0,
             };
         }
 
@@ -190,6 +214,7 @@ impl BodyText {
             text: self.text[self.base_byte + start_byte..self.base_byte + end_byte].to_owned(),
             runs,
             start_byte,
+            rows: end_row - start_row,
         }
     }
 }
@@ -207,8 +232,7 @@ impl BodySlice {
         self.start_byte
     }
 
-    /// Concatenated text of the selected runs; used by the body tests.
-    #[cfg(test)]
+    /// Concatenated text of the selected runs.
     pub fn selected_text(&self) -> String {
         let mut text = String::new();
         for run in &self.runs {
@@ -217,6 +241,31 @@ impl BodySlice {
             }
         }
         text
+    }
+
+    /// Appends the in-progress row after the committed slice. Selection ranges
+    /// were computed before this call, so live text is never selected.
+    pub fn push_live_row(&mut self, row: &Row) {
+        if self.rows > 0 {
+            let start = self.text.len();
+            self.text.push('\n');
+            push_slice_run(
+                &mut self.runs,
+                start..start + 1,
+                0,
+                OutputStyle::default(),
+                false,
+            );
+        }
+        self.rows += 1;
+        for span in &row.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let start = self.text.len();
+            self.text.push_str(&span.text);
+            push_slice_run(&mut self.runs, start..self.text.len(), 0, span.style, false);
+        }
     }
 }
 

@@ -6,3 +6,6 @@ mod service;
 mod tests;
 
 pub use service::SessionService;
+// Presentation key dispatch and the editor dock consume these in T6.
+#[allow(unused_imports)]
+pub use service::{EditCommand, EditorState, SubmitOutcome};
