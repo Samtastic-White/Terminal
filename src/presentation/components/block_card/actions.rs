@@ -29,27 +29,46 @@ pub const CARD_ACTIONS: [CardAction; 3] = [
     },
 ];
 
-/// Element id unique per block and action; IDs only need to be stable within
-/// the card's header.
-pub(super) fn action_id(kind: CopyKind, block: BlockId) -> ElementId {
+/// Where a header is painted. The sticky overlay and the in-flow card render
+/// the same actions, so their element IDs must stay distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionScope {
+    Flow,
+    Pinned,
+}
+
+impl ActionScope {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Flow => "flow",
+            Self::Pinned => "pinned",
+        }
+    }
+}
+
+/// Element id unique per block, action and scope; IDs only need to be stable
+/// within the header's surface.
+pub(super) fn action_id(kind: CopyKind, block: BlockId, scope: ActionScope) -> ElementId {
     let name = match kind {
         CopyKind::WholeBlock => "copy-block",
         CopyKind::Command => "copy-command",
         CopyKind::Output => "copy-output",
     };
-    (name, block.get()).into()
+    let base: ElementId = (name, block.get()).into();
+    (base, scope.suffix()).into()
 }
 
 pub(super) fn render_action(
     block: BlockId,
     action: CardAction,
+    scope: ActionScope,
     group: &SharedString,
     theme: &TerminalTheme,
     on_copy: &CopyHandler,
 ) -> impl IntoElement {
     let on_copy = on_copy.clone();
     div()
-        .id(action_id(action.kind, block))
+        .id(action_id(action.kind, block, scope))
         .invisible()
         .group_hover(group.clone(), |style| style.visible())
         .px(px(6.0))

@@ -4,12 +4,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::domain::block::{Block, BlockId};
+use crate::domain::block::{Block, BlockId, CopyKind};
 use crate::domain::output::{Color, Row, Span, TextStyle};
+use crate::presentation::theme::TerminalTheme;
 
 use super::{
-    CARD_ACTIONS, CardSnapshot, StatusTone, build_body_text, card_snapshot, clamp_selection,
-    status_label, status_tone,
+    BlockUiState, CARD_ACTIONS, CardSnapshot, StatusTone, build_body_text, card_snapshot,
+    clamp_selection, command_preview, status_label, status_tone,
 };
 
 fn row(text: &str) -> Row {
@@ -232,6 +233,76 @@ fn running_snapshot_has_no_duration_and_empty_output_has_no_body() {
     assert_eq!(snapshot.status_label, "running");
     assert_eq!(snapshot.meta, "just now");
     assert!(!snapshot.has_body);
+}
+
+#[test]
+fn command_preview_keeps_only_the_first_logical_line() {
+    let mono = Instant::now();
+    let mut block = block(1, mono);
+    let command = "for x in 1 2\ndo\necho $x\ndone";
+    block.set_command(command.into());
+
+    assert_eq!(command_preview(&block), "for x in 1 2…");
+    assert_eq!(block.copy(CopyKind::Command), command);
+}
+
+#[test]
+fn live_row_appends_after_the_committed_slice_and_is_never_selected() {
+    let body = build_body_text(&[row("done")]);
+    let mut slice = body.slice(0, 1, Some(0..4));
+
+    slice.push_live_row(&row("live"));
+
+    assert_eq!(slice.text(), "done\nlive");
+    assert_eq!(slice.selected_text(), "done");
+    assert!(
+        slice
+            .runs()
+            .iter()
+            .filter(|run| run.selected())
+            .all(|run| run.range().end <= 4)
+    );
+
+    let blank = build_body_text(&[Row::default()]);
+    let mut blank_slice = blank.slice(0, 1, None);
+    blank_slice.push_live_row(&row("live"));
+    assert_eq!(blank_slice.text(), "\nlive");
+}
+
+#[test]
+fn body_selection_text_spans_rows_and_starts_on_boundaries() {
+    let body = build_body_text(&[row("one"), row("two")]);
+
+    assert_eq!(body.selected_text(1..6), "ne\ntw");
+    assert_eq!(body.selected_text(4..7), "two");
+}
+
+#[test]
+fn a_live_row_shapes_a_body_even_before_the_first_committed_row() {
+    let mono = Instant::now();
+    let empty = block(2, mono);
+    let mut block = block(1, mono);
+    block.push_row(row("done"));
+    let mut ui = BlockUiState::new();
+    ui.sync_body(&block);
+
+    let live = row("in progress");
+    assert!(ui.set_live(Some(&live)));
+    assert!(ui.prepare_body(&TerminalTheme::default()).is_some());
+    assert_eq!(
+        ui.pending.as_ref().map(|pending| pending.text.as_str()),
+        Some("done\nin progress")
+    );
+    assert!(!ui.set_live(Some(&live)));
+
+    let mut ui = BlockUiState::new();
+    ui.sync_body(&empty);
+    assert!(ui.set_live(Some(&live)));
+    assert!(ui.prepare_body(&TerminalTheme::default()).is_some());
+    assert_eq!(
+        ui.pending.as_ref().map(|pending| pending.text.as_str()),
+        Some("in progress")
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@
 //! still building so prompts and typed input render before a newline commits
 //! them. It is not a viewport contract.
 
+use crate::domain::keymap::TerminalModes;
 use crate::domain::output::Row;
 use crate::domain::semantic::SemanticEvent;
 use crate::domain::size::TerminalSize;
@@ -37,6 +38,13 @@ pub trait TerminalSurfacePort {
     /// no cell is written. Reading it never commits or clears the row; only a
     /// newline, auto-wrap, or `flush` retires it.
     fn active_row(&self) -> Option<Row>;
+
+    /// Private modes the foreground application negotiated in this stream.
+    /// Reading them never changes the stream.
+    // The session encoder becomes the production reader in T4; until then the
+    // parser and the test mock are the only implementors.
+    #[allow(dead_code)]
+    fn modes(&self) -> TerminalModes;
 
     /// Flushes the partially built row and every not-yet-drained item. A
     /// fully unwritten line fabricates no row.

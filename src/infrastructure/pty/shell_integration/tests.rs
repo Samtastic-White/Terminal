@@ -85,6 +85,65 @@ fn zshrc_sources_the_user_file_before_the_integration() {
 }
 
 #[test]
+fn integration_script_applies_engine_mode_before_the_markers() {
+    assert!(INTEGRATION_SCRIPT.contains("unsetopt zle prompt_sp prompt_cr"));
+    assert!(INTEGRATION_SCRIPT.contains("PS1='' RPROMPT='' PROMPT2='' PROMPT_EOL_MARK=''"));
+    assert!(INTEGRATION_SCRIPT.contains("[[ -t 0 ]] && stty -echo 2>/dev/null"));
+    assert!(INTEGRATION_SCRIPT.contains("[[ -t 0 ]] && stty echo 2>/dev/null"));
+
+    let precmd = INTEGRATION_SCRIPT
+        .find("_native_terminal_precmd")
+        .expect("precmd hook");
+    let preexec = INTEGRATION_SCRIPT
+        .find("_native_terminal_preexec")
+        .expect("preexec hook");
+    let d_marker = INTEGRATION_SCRIPT.find("133;D;%s").expect("D marker");
+    let c_marker = INTEGRATION_SCRIPT.find("133;C").expect("C marker");
+
+    assert!(
+        precmd < d_marker,
+        "precmd silences echo before the D marker"
+    );
+    assert!(
+        preexec < c_marker,
+        "preexec restores echo before the C marker"
+    );
+}
+
+#[test]
+fn missing_stty_never_fails_shell_startup() {
+    let user = scratch_user_dir("no-stty");
+    let integration = ShellIntegration::prepare(&user).expect("wrapper prepared");
+    let script = integration.dir().join(INTEGRATION_FILE);
+    let empty_path = scratch_user_dir("no-stty-path");
+
+    let output = Command::new("/bin/zsh")
+        .env("NT_SCRIPT", &script)
+        .env("NATIVE_TERMINAL", "1")
+        .env_remove("NATIVE_TERMINAL_ACTIVE")
+        .env("PATH", &empty_path)
+        .args([
+            "-fic",
+            "source \"$NT_SCRIPT\"; printf '%s %s\\n' \"${#precmd_functions}\" \"${#preexec_functions}\"",
+        ])
+        .output()
+        .expect("zsh probe runs");
+
+    assert!(
+        output.status.success(),
+        "zsh failed without stty: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf-8").trim(),
+        "1 1"
+    );
+
+    fs::remove_dir_all(user).expect("scratch cleanup");
+    fs::remove_dir_all(empty_path).expect("scratch cleanup");
+}
+
+#[test]
 fn integration_script_avoids_print_payload_expansion() {
     assert!(!INTEGRATION_SCRIPT.contains("print -P"));
     assert!(!INTEGRATION_SCRIPT.contains("print -rn"));

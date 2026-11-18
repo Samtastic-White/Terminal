@@ -1,6 +1,7 @@
 //! Writer unit tests, grouped by area: text, SGR, erase, OSC.
 
 mod erase;
+mod modes;
 mod osc;
 mod sgr;
 mod text;

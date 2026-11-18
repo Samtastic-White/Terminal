@@ -5,6 +5,8 @@ use crate::presentation::theme::TerminalTheme;
 
 /// Renders one styled row. Rows are already wrapped by the writer, so no
 /// re-flow is applied here.
+// The feedback overlay and running live row consume these in T7.
+#[allow(dead_code)]
 fn render_row(row: &Row, theme: &TerminalTheme) -> impl IntoElement {
     let mut line = div()
         .flex()
